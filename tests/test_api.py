@@ -1,20 +1,58 @@
 
 import pytest
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from unittest.mock import patch
 
-from app.services.gemini import GeminiRateLimitError
+from app.db import Base, get_db
+from app.services.gemini import GeminiAnalysisError, GeminiRateLimitError
 from app.models import Submission
 
-from app.main import app
+from app.main import analyze_pending_submissions, app
 
 
-@pytest.fixture(scope="module")
-def client():
-    # Entering the context manager runs FastAPI's startup/lifespan hooks.
-    with TestClient(app) as test_client:
-        yield test_client
+@pytest.fixture
+def client(monkeypatch):
+    test_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=test_engine)
+    TestingSession = sessionmaker(
+        bind=test_engine,
+        autoflush=False,
+        autocommit=False,
+    )
+
+    def override_get_db():
+        session = TestingSession()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("app.main.engine", test_engine)
+    monkeypatch.setattr(
+        "app.security.get_settings",
+        lambda: SimpleNamespace(
+            service_api_key="",
+            submission_rate_limit_per_minute=0,
+        ),
+    )
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        # The app's startup hook also uses the isolated in-memory engine.
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        Base.metadata.drop_all(bind=test_engine)
+        test_engine.dispose()
 
 
 def test_health(client):
@@ -22,6 +60,9 @@ def test_health(client):
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert response.json()["service"] == "ai-labs-problem-discovery"
+    assert response.json()["version"] == app.version
+    assert client.get("/openapi.json").status_code == 200
 
 
 def test_create_and_read_submission(client):
@@ -171,6 +212,35 @@ def test_single_analysis_rate_limit_keeps_submission_pending(client):
     assert fetched.json()["analysis_status"] == "pending"
 
 
+def test_failed_analysis_does_not_mark_submission_completed(client):
+    create_response = client.post(
+        "/api/submissions",
+        json={
+            "text": "Shop owners struggle to reconcile delivery orders.",
+            "source_name": "manual",
+            "language": "en",
+        },
+    )
+    assert create_response.status_code == 201
+    submission_id = create_response.json()["id"]
+
+    with patch(
+        "app.main.analyze_submission",
+        side_effect=GeminiAnalysisError(
+            "Gemini response failed schema validation."
+        ),
+    ):
+        response = client.post(
+            f"/api/submissions/{submission_id}/analyze"
+        )
+
+    assert response.status_code == 502
+    fetched = client.get(f"/api/submissions/{submission_id}")
+    assert fetched.status_code == 200
+    assert fetched.json()["analysis_status"] == "failed"
+    assert fetched.json()["analysis_json"] is None
+
+
 def test_batch_analysis_stops_on_rate_limit(client):
     # Create two pending submissions.
     submission_ids = []
@@ -214,3 +284,112 @@ def test_batch_analysis_stops_on_rate_limit(client):
     )
     assert fetched.json()["analysis_status"] == "pending"
 
+
+def test_batch_analysis_keeps_success_when_later_analysis_fails():
+    submissions = [
+        SimpleNamespace(
+            id=index,
+            text=f"Submission {index} describes a concrete problem.",
+            source_name="manual",
+            language="en",
+            analysis_status="pending",
+            analysis_error=None,
+            analysis_json=None,
+            model_name=None,
+            prompt_version=None,
+            severity_score=None,
+            frequency_score=None,
+        )
+        for index in (901, 902)
+    ]
+
+    class FakeDB:
+        commits = 0
+        claim_rowcount = 1
+
+        def scalars(self, _statement):
+            return SimpleNamespace(all=lambda: submissions)
+
+        def scalar(self, _statement):
+            return 0
+
+        def get(self, _model, _identity):
+            return None
+
+        def commit(self):
+            self.commits += 1
+
+        def execute(self, _statement):
+            return SimpleNamespace(rowcount=self.claim_rowcount)
+
+        def refresh(self, _item):
+            pass
+
+    extraction = SimpleNamespace(
+        model_dump_json=lambda: '{"is_genuine_problem": true}',
+        urgency_1_to_5=3,
+        frequency_signal_1_to_5=2,
+    )
+    db = FakeDB()
+
+    with patch(
+        "app.main.analyze_submission",
+        side_effect=[
+            (extraction, "test-model"),
+            GeminiAnalysisError("Gemini response failed validation."),
+        ],
+    ):
+        result = analyze_pending_submissions(limit=2, db=db)
+
+    assert result["processed"] == 2
+    assert result["completed"] == 1
+    assert result["failed"] == 1
+    assert [item["status"] for item in result["items"]] == [
+        "completed",
+        "failed",
+    ]
+    assert submissions[0].analysis_json == '{"is_genuine_problem": true}'
+    assert submissions[0].analysis_status == "completed"
+    assert submissions[1].analysis_status == "failed"
+
+
+def test_batch_analysis_skips_record_claimed_by_another_worker():
+    from app.services.analysis import analyze_pending_batch
+
+    submission = SimpleNamespace(
+        id=903,
+        text="Submission is waiting for another worker.",
+        source_name="manual",
+        language="en",
+        analysis_status="pending",
+        analysis_error=None,
+        analysis_json=None,
+        model_name=None,
+        prompt_version=None,
+        severity_score=None,
+        frequency_score=None,
+    )
+
+    class FakeDB:
+        def scalars(self, _statement):
+            return SimpleNamespace(all=lambda: [submission])
+
+        def scalar(self, _statement):
+            return 1
+
+        def execute(self, _statement):
+            return SimpleNamespace(rowcount=0)
+
+        def commit(self):
+            pass
+
+    calls = []
+    result = analyze_pending_batch(
+        FakeDB(),
+        1,
+        analyzer=lambda *_args: calls.append(1),
+    )
+
+    assert result["processed"] == 0
+    assert result["skipped_claimed_elsewhere"] == 1
+    assert calls == []

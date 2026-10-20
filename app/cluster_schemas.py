@@ -2,6 +2,10 @@
 from datetime import datetime
 
 from pydantic import BaseModel, Field, ConfigDict
+from app.operator_schemas import (
+    EvidenceProvenanceRead,
+    OpportunitySummaryRead,
+)
 
 
 class ClusterCreate(BaseModel):
@@ -28,7 +32,7 @@ class ClusterRead(BaseModel):
 
 class EvidenceAttach(BaseModel):
     submission_id: int = Field(gt=0)
-    is_independent: bool = True
+    is_independent: bool = False
     relationship_type: str = Field(
         default="supports",
         pattern="^(supports|contradicts|mentions)$",
@@ -53,4 +57,12 @@ class EvidenceRead(BaseModel):
 class ClusterDetail(ClusterRead):
     evidence_count: int
     independent_evidence_count: int
+    recorded_independent_evidence_count: int = 0
+    unique_evidence_count: int = 0
+    duplicate_evidence_count: int = 0
+    verified_independent_evidence_count: int = 0
     evidence: list[EvidenceRead]
+    evidence_provenance: list[EvidenceProvenanceRead] = Field(
+        default_factory=list
+    )
+    opportunity_summary: OpportunitySummaryRead | None = None

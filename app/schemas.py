@@ -1,5 +1,12 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    field_serializer,
+    model_validator,
+)
 from typing import Literal
 
 
@@ -27,6 +34,38 @@ class SubmissionRead(BaseModel):
     prompt_version: str | None
     analysis_error: str | None
 
+    @field_serializer("analysis_error")
+    def serialize_analysis_error(self, value: str | None) -> str | None:
+        if value is None:
+            return None
+        safe_codes = {
+            "provider_not_configured",
+            "rate_limited",
+            "analysis_failed",
+        }
+        if value in safe_codes:
+            return value
+        normalized = value.casefold()
+        if any(marker in normalized for marker in ("rate limit", "quota", "429")):
+            return "rate_limited"
+        if "config" in normalized:
+            return "provider_not_configured"
+        return "analysis_failed"
+
+
+ProblemCategory = Literal[
+    "Business Operations",
+    "Sales & Marketing",
+    "Finance & Accounting",
+    "Customer Support",
+    "Human Resources",
+    "Productivity",
+    "Software & IT",
+    "Healthcare",
+    "Education",
+    "Other",
+]
+
 
 class ProblemExtraction(BaseModel):
     is_genuine_problem: bool
@@ -44,7 +83,7 @@ class ProblemExtraction(BaseModel):
     willingness_to_pay_signal: Literal[
         "explicit", "suggested", "none", "unclear"
     ] = "unclear"
-    evidence_quotes: list[str] = Field(default_factory=list)
+    evidence_quotes: list[str] = Field(default_factory=list, max_length=3)
     noise_reason: str | None = None
 
     rejection_reason: str | None = None
@@ -52,10 +91,31 @@ class ProblemExtraction(BaseModel):
     affected_user: str
     context: str
     current_workaround: str | None = None
-    category: str
+    category: ProblemCategory
     industry: str
-    urgency_1_to_5: int = Field(ge=1, le=5)
-    frequency_signal_1_to_5: int = Field(ge=1, le=5)
-    evidence_strength_1_to_5: int = Field(ge=1, le=5)
+    software_buildability: Literal["likely", "unclear", "unlikely"] = "unclear"
+    software_buildability_reason: str = (
+        "The submission does not provide enough information to assess this."
+    )
+    urgency_1_to_5: int = Field(strict=True, ge=1, le=5)
+    frequency_signal_1_to_5: int = Field(strict=True, ge=1, le=5)
+    evidence_strength_1_to_5: int = Field(strict=True, ge=1, le=5)
     tags: list[str] = Field(default_factory=list)
     uncertainty_notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_rejection_details(self):
+        if (
+            self.signal_type in {"general_discussion", "noise"}
+            and self.is_genuine_problem
+        ):
+            raise ValueError(
+                "General discussion and noise cannot be genuine problems."
+            )
+        if not self.is_genuine_problem and not self.rejection_reason:
+            raise ValueError(
+                "A rejection reason is required for non-problem submissions."
+            )
+        if self.signal_type == "noise" and not self.noise_reason:
+            raise ValueError("A noise reason is required for noise.")
+        return self

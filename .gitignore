@@ -12,6 +12,10 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
 
 # Local data and databases
 data/

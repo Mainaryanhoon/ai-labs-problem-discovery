@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,6 +9,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/problem_discovery.db"
     apify_api_token: str = ""
     apify_actor_id: str = ""
+    service_api_key: str = ""
+    submission_rate_limit_per_minute: int = Field(default=0, ge=0)
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
     
     apify_reddit_actor_id: str = "anyxsolutions~reddit-scraper"

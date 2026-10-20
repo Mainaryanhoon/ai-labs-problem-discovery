@@ -28,3 +28,8 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def initialize_database(target_engine=None) -> None:
+    """Create missing tables without altering existing application tables."""
+    Base.metadata.create_all(bind=target_engine or engine)
