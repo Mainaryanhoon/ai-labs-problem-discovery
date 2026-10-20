@@ -26,4 +26,5 @@ data/
 # Editor and OS files
 .vscode/
 .DS_Store
-Thumbs.db
+Thumbs.dbfrontend/tsconfig.tsbuildinfo
+**/build/
