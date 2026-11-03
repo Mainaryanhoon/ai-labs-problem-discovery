@@ -23,6 +23,10 @@ from app.provenance import (
     record_source_observation,
     record_source_provenance,
 )
+from app.docs_filter_helpers import (
+    fails_min_word_gate,
+    reddit_topic_allowed,
+)
 from app.ingestion import (
     PROBLEM_SIGNALS,
     clean_text,
@@ -43,7 +47,14 @@ def _collect_apify(
     settings = get_settings()
 
     if not settings.apify_api_token.strip():
-        raise HTTPException(status_code=503, detail="Apify API token is not configured.")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Apify API token is not configured. Set APIFY_API_TOKEN in "
+                ".env (Apify Console → Settings → Integrations) and restart "
+                "uvicorn. Required for Reddit, X, and YouTube."
+            ),
+        )
     if not actor_id or not actor_id.strip():
         raise HTTPException(status_code=503, detail="Apify Actor is not configured.")
 
@@ -170,6 +181,15 @@ def _provider_metadata(item: dict[str, Any], source_name: str) -> dict:
                 if isinstance(item.get("author"), str)
                 else None
             ),
+            "author_id": next(
+                (
+                    str(item[key]).strip()[:120]
+                    for key in ("authorId", "author_id", "authorFullname")
+                    if isinstance(item.get(key), (str, int))
+                    and str(item[key]).strip()
+                ),
+                None,
+            ),
         }
     return {
         key: value
@@ -261,7 +281,12 @@ def _save_items(
             continue
 
         text = f"{title}\n\n{body}".strip()
-        if len(text) < 15 or not PROBLEM_SIGNALS.search(text):
+        # RUBRIC Gate 1: only length rule is <12 words. Do not drop longer posts
+        # solely for being short/casual; PROBLEM_SIGNALS still reduces pure noise.
+        if fails_min_word_gate(text):
+            irrelevant += 1
+            continue
+        if source_name == "X" and not PROBLEM_SIGNALS.search(text):
             irrelevant += 1
             continue
 
@@ -272,6 +297,9 @@ def _save_items(
         community = reference.community
         if source_name == "Reddit":
             community = community or normalize_subreddit(item.get("subreddit"))
+            if not reddit_topic_allowed(community, text):
+                irrelevant += 1
+                continue
             if per_community_limits is not None:
                 if community not in per_community_limits:
                     irrelevant += 1
@@ -394,29 +422,24 @@ def _save_items(
     }
 
 
-DEFAULT_SEARCHES = [
-    '"looking for a tool"',
-    '"manual workaround"',
-    '"any alternative to"',
-    '"wish there was"',
-]
-
+# Legacy X queries remain callable outside the current pilot policy.
 DEFAULT_X_SEARCH_TERMS = [
-    '"struggling" OR "frustrating" OR "manual work" OR "workaround"',
+    '"Indian startup" (problem OR struggle OR margin OR cost) lang:en -filter:retweets',
+    '"D2C India" (CAC OR logistics OR RTO OR profitable) lang:en -filter:retweets',
+    '"marketing budget" (ROI OR waste OR expensive) lang:en -filter:retweets',
 ]
 
 
 REDDIT_SUBREDDIT_SHORTLIST = (
-    "smallbusiness",
-    "Entrepreneur",
-    "SaaS",
-    "startups",
-    "productivity",
-    "automation",
+    "GoogleAnalytics",
+    "GoogleTagManager",
+    "analytics",
+    "bigquery",
+    "dataengineering",
+    "datascience",
     "ecommerce",
     "shopify",
-    "sysadmin",
-    "devops",
+    "PPC",
 )
 MAX_SUBREDDITS = 10
 X_MIN_QUERY_ITEMS = 50
@@ -456,7 +479,19 @@ def collect_reddit(
     }
     per_community_limits = None
     if subreddits is None:
-        actor_input["searchQueries"] = DEFAULT_SEARCHES
+        names = [
+            name
+            for raw in REDDIT_SUBREDDIT_SHORTLIST
+            if (name := normalize_subreddit(raw))
+        ]
+        actor_input["startUrls"] = _reddit_subreddit_urls(
+            list(REDDIT_SUBREDDIT_SHORTLIST)
+        )
+        base_limit, remainder = divmod(limit, max(len(names), 1))
+        per_community_limits = {
+            name: base_limit + int(index < remainder)
+            for index, name in enumerate(names)
+        }
     else:
         actor_input["startUrls"] = _reddit_subreddit_urls(subreddits)
         names = list(dict.fromkeys(

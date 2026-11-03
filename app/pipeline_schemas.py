@@ -3,13 +3,21 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 
-PipelineSource = Literal["hacker_news", "stack_exchange", "reddit", "x"]
+PipelineSource = Literal[
+    "official_docs",
+    "stack_exchange",
+    "reddit",
+    "hacker_news",
+    "youtube",
+    "articles",
+    "x",
+]
 
 
 class PipelineRunRequest(BaseModel):
     sources: list[PipelineSource] = Field(
         min_length=1,
-        max_length=4,
+        max_length=7,
     )
     hacker_news_limit: int = Field(default=10, ge=1, le=100)
     stack_exchange_limit: int = Field(default=10, ge=1, le=100)
@@ -29,8 +37,18 @@ class PipelineRunRequest(BaseModel):
             "Fixed at the X actor's documented minimum of 50 results per query."
         ),
     )
-    analysis_limit: int = Field(default=10, ge=1, le=30)
-    clustering_limit: int = Field(default=10, ge=1, le=30)
+    youtube_limit: int = Field(default=15, ge=1, le=50)
+    official_docs_limit: int = Field(default=25, ge=1, le=100)
+    articles_limit: int = Field(default=50, ge=1, le=100)
+    analysis_limit: int = Field(default=50, ge=1, le=100)
+    analysis_scope: Literal["this_run", "backlog"] = Field(
+        default="this_run",
+        description=(
+            "this_run: analyze only submissions collected in this run. "
+            "backlog: analyze oldest pending/failed rows across the database."
+        ),
+    )
+    clustering_limit: int = Field(default=50, ge=1, le=100)
     retry_needs_review: bool = False
     retry_failed_clustering: bool = False
     retry_failed_analysis: bool = False

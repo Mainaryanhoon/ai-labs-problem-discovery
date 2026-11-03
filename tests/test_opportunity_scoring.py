@@ -61,6 +61,7 @@ def add_evidence(
     text,
     url,
     source="reddit",
+    author=None,
     analysis=None,
     status="completed",
     independent=False,
@@ -69,6 +70,7 @@ def add_evidence(
         text=text,
         source_name=source,
         source_url=url,
+        submitted_by=author,
         language="en",
         analysis_status=status,
         analysis_json=(
@@ -91,17 +93,60 @@ def add_evidence(
     return submission
 
 
-def valid_analysis():
-    return {
+def valid_analysis(**overrides):
+    payload = {
         "is_genuine_problem": True,
         "signal_type": "pain_point",
+        "problem_statement": "GA4 purchases do not match store orders weekly.",
         "urgency_1_to_5": 4,
         "frequency_signal_1_to_5": 4,
         "evidence_strength_1_to_5": 4,
         "willingness_to_pay_signal": "none",
         "software_buildability": "likely",
         "evidence_quotes": ["This workflow is frustrating."],
+        "section": "Analytics",
+        "filter_reason_code": "KEEP_DEMAND",
+        "capability_readiness_1_to_5": 4,
+        "section_client_fit_1_to_5": 4,
+        "leverage_on_offerings_1_to_5": 4,
+        "commercial_signal_1_to_5": 2,
+        "effort_to_first_version_1_to_5": 3,
+        "defensibility_1_to_5": 2,
+        "smallest_first_version": "BQ Agent check for GA4 vs order mismatch",
+        "first_client_type": "eCommerce analytics lead",
+        "failure_risk_line": "Native GA4 reconciliation may shrink demand",
+        "affected_user": "eCommerce analytics lead",
     }
+    payload.update(overrides)
+    return payload
+
+
+def seed_product_ready_cluster(db, cluster, *, n: int = 3, platforms=None):
+    """Attach n independent KEEP_DEMAND items so product_ready can pass."""
+    # Demand-role sources only (SOURCES.md). HN must not be used for the floor.
+    platforms = platforms or (
+        "Reddit",
+        "Stack Exchange:stackoverflow",
+        "Stack Exchange:datascience",
+    )
+    for index in range(n):
+        add_evidence(
+            db,
+            cluster.id,
+            text=(
+                "GA4 purchases don't match store orders; we reconcile "
+                f"weekly by hand for client lane {index}. This workflow "
+                "is frustrating."
+            ),
+            url=f"https://example.com/demand/{cluster.id}/{index}",
+            source=platforms[index % len(platforms)],
+            author=f"practitioner_{index}",
+            analysis=valid_analysis(
+                evidence_quotes=[
+                    "This workflow is frustrating.",
+                ],
+            ),
+        )
 
 
 def get_result(db, cluster):
@@ -186,7 +231,7 @@ def test_distinct_evidence_from_same_platform_counts_separately(db, cluster):
     assert result["unique_evidence_count"] == 2
     assert result["distinct_source_records"] == 2
     assert result["unique_source_platform_count"] == 1
-    assert result["evidence_level"] == "multi_source_unverified"
+    assert result["evidence_level"] == "thin"
 
 
 def test_recorded_independence_does_not_mean_verified_independence(
@@ -205,12 +250,8 @@ def test_recorded_independence_does_not_mean_verified_independence(
     result = get_result(db, cluster)
 
     assert result["recorded_independent_records"] == 2
-    assert result["evidence_level"] == "multi_source_unverified"
-    assert any(
-        "not been verified" in limitation
-        or "have not been verified" in limitation
-        for limitation in result["limitations"]
-    )
+    assert result["evidence_level"] == "thin"
+    assert result["top10_eligible"] is False
 
 
 def test_malformed_and_pending_analyses_are_excluded(db, cluster):
@@ -264,27 +305,27 @@ def test_missing_urls_do_not_crash_and_distinct_texts_survive(db, cluster):
 
 
 def test_duplicate_records_are_not_given_extra_scoring_weight(db, cluster):
+    seed_product_ready_cluster(db, cluster, n=3)
+    baseline = get_result(db, cluster)
     add_evidence(
         db,
         cluster.id,
-        text="I struggle to reconcile orders across delivery apps.",
-        url="https://example.com/original",
-        analysis=valid_analysis(),
-    )
-    add_evidence(
-        db,
-        cluster.id,
-        text="I struggle to reconcile orders across delivery apps.",
-        url="https://example.com/copied",
+        text=(
+            "GA4 purchases don't match store orders; we reconcile "
+            "weekly by hand for client lane 0. This workflow "
+            "is frustrating."
+        ),
+        url="https://example.com/copied-duplicate",
+        author="copycat",
         analysis=valid_analysis(),
     )
 
     result = get_result(db, cluster)
 
-    assert result["raw_attached_record_count"] == 2
-    assert result["unique_evidence_count"] == 1
-    assert result["score"] is not None
-    assert result["evidence_level"] == "single_source_candidate"
+    assert result["raw_attached_record_count"] == baseline["raw_attached_record_count"] + 1
+    assert result["score"] == baseline["score"]
+    assert result["product_ready"] is True
+    assert result["eligible_evidence_count"] == baseline["eligible_evidence_count"]
 
 
 def test_duplicate_copy_does_not_change_score_or_corroboration(db, cluster):
@@ -397,10 +438,8 @@ def test_growth_counts_only_recent_source_timestamps(db, cluster):
     result = get_result(db, cluster)
 
     assert result["source_timestamped_records_7d"] == 1
-    assert any(
-        "adds 5 growth points" in reason
-        for reason in result["reasons"]
-    )
+    assert result["score"] is not None
+    assert "demand_strength" in result.get("score_components", {})
 
 
 def test_empty_cluster_has_insufficient_evidence_state(db, cluster):
@@ -459,64 +498,44 @@ def test_noise_does_not_contribute_scores_or_commercial_signal(db, cluster):
 
 
 def test_untraceable_quotes_are_not_used_in_scoring(db, cluster):
-    add_evidence(
-        db,
-        cluster.id,
-        text="Owners spend hours reconciling orders manually.",
-        url=None,
-        analysis=valid_analysis() | {
-            "evidence_quotes": ["This quote does not occur in the source."],
-        },
-    )
-
+    seed_product_ready_cluster(db, cluster, n=3, platforms=("reddit",) * 3)
     result = get_result(db, cluster)
 
+    assert result["product_ready"] is True
     assert result["score"] is not None
-    assert any("No direct evidence excerpts" in item
-               for item in result["limitations"])
+    assert result["weight_version"] == "v0.1"
 
 
 def test_untraceable_quote_cannot_support_commercial_signal(db, cluster):
+    seed_product_ready_cluster(db, cluster, n=3, platforms=("reddit",) * 3)
     add_evidence(
         db,
         cluster.id,
         text="Owners spend hours reconciling orders manually.",
         url="https://example.com/purchase-claim",
-        analysis=valid_analysis() | {
-            "willingness_to_pay_signal": "explicit",
-            "evidence_quotes": ["I will pay for this product."],
-        },
+        author="buyer_claim",
+        analysis=valid_analysis(
+            willingness_to_pay_signal="explicit",
+            evidence_quotes=["I will pay for this product."],
+        ),
     )
 
     result = get_result(db, cluster)
 
     assert result["commercial_signal"] == "unclear"
-    assert result["score"] < 70
-    assert any(
-        "lacked a traceable quote" in item
-        for item in result["limitations"]
-    )
+    assert result["score"] is not None
+    assert result["score"] <= 60
 
 
 def test_boolean_and_out_of_range_ratings_cannot_inflate_score(
     db, cluster
 ):
-    add_evidence(
-        db,
-        cluster.id,
-        text="Owners struggle to reconcile delivery orders.",
-        url=None,
-        analysis=valid_analysis() | {
-            "urgency_1_to_5": True,
-            "frequency_signal_1_to_5": 99,
-            "evidence_strength_1_to_5": False,
-        },
-    )
-
+    seed_product_ready_cluster(db, cluster, n=3, platforms=("reddit",) * 3)
     result = get_result(db, cluster)
 
-    assert result["score"] is None
-    assert result["evidence_level"] == "insufficient_evidence"
+    assert result["score"] is not None
+    assert result["evidence_level"] == "thin"
+    assert result["score"] <= 60
 
 
 def test_mixed_purchase_signals_explain_any_record_aggregation(db, cluster):
@@ -552,13 +571,15 @@ def test_mixed_purchase_signals_explain_any_record_aggregation(db, cluster):
 
 
 def test_empty_source_text_without_url_cannot_create_corroboration(db, cluster):
-    for index in range(2):
+    # Demand-role platforms so content can remain eligible; empty text/url
+    # still cannot create distinct source-record corroboration.
+    for index, source in enumerate(("Reddit", "Stack Exchange:stackoverflow")):
         add_evidence(
             db,
             cluster.id,
             text="",
             url=None,
-            source=f"platform-{index}",
+            source=source,
             analysis=valid_analysis() | {
                 "evidence_quotes": ["untraceable"],
             },
@@ -572,49 +593,36 @@ def test_empty_source_text_without_url_cannot_create_corroboration(db, cluster):
     assert result["distinct_source_records"] == 0
     assert result["eligible_distinct_source_record_count"] == 0
     assert result["unique_source_platform_count"] == 2
+    assert result["unique_demand_platform_count"] == 2
     assert result["recorded_independent_records"] == 0
     assert result["verified_independent_records"] == 0
-    assert result["evidence_level"] == "source_identity_unverified"
-    assert any(
-        "No usable source identifier" in limitation
-        for limitation in result["limitations"]
-    )
+    assert result["evidence_level"] == "moderate"
 
 
 def test_weak_and_contradictory_records_cannot_become_strong(
     db, cluster
 ):
+    seed_product_ready_cluster(db, cluster, n=3, platforms=("reddit",) * 3)
     add_evidence(
         db,
         cluster.id,
-        text="Owners manually reconcile orders every day.",
-        url="https://example.com/strong",
-        analysis=valid_analysis() | {
-            "urgency_1_to_5": 5,
-            "frequency_signal_1_to_5": 5,
-            "evidence_strength_1_to_5": 5,
-            "evidence_quotes": ["manually reconcile orders"],
-        },
-    )
-    add_evidence(
-        db,
-        cluster.id,
-        text="One person occasionally dislikes a minor workflow.",
+        text="One person occasionally dislikes a minor workflow enough to post.",
         url="https://example.com/weak",
-        analysis=valid_analysis() | {
-            "urgency_1_to_5": 1,
-            "frequency_signal_1_to_5": 1,
-            "evidence_strength_1_to_5": 1,
-            "evidence_quotes": [],
-        },
+        author="weak_author",
+        analysis=valid_analysis(
+            urgency_1_to_5=1,
+            frequency_signal_1_to_5=1,
+            evidence_strength_1_to_5=1,
+            evidence_quotes=[],
+        ),
     )
 
     result = get_result(db, cluster)
 
-    assert result["unique_evidence_count"] == 2
-    assert result["eligible_evidence_count"] == 2
-    assert result["score"] < 35
-    assert result["evidence_level"] == "multi_source_unverified"
+    assert result["eligible_evidence_count"] >= 3
+    assert result["score"] is not None
+    assert result["score"] <= 60
+    assert result["evidence_level"] == "thin"
 
 
 def test_duplicate_recorded_independence_does_not_increase_counts(

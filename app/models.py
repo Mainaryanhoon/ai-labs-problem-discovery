@@ -297,6 +297,51 @@ class WeeklyRankingEntry(Base):
     limitations_json: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class MonthlyRankingSnapshot(Base):
+    __tablename__ = "monthly_ranking_snapshots"
+
+    month_start: Mapped[date] = mapped_column(Date, primary_key=True)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    top_k: Mapped[int] = mapped_column(Integer, nullable=False)
+    weight_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    email_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    email_status: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+
+class MonthlyRankingEntry(Base):
+    __tablename__ = "monthly_ranking_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "month_start",
+            "cluster_id",
+            name="uq_monthly_ranking_cluster",
+        ),
+    )
+
+    month_start: Mapped[date] = mapped_column(
+        ForeignKey("monthly_ranking_snapshots.month_start", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    rank: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cluster_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    section: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    category: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    evidence_level: Mapped[str] = mapped_column(String(50), nullable=False)
+    offering_angle: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    smallest_first_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    first_client_type: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    failure_risk_line: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reasons_json: Mapped[str] = mapped_column(Text, nullable=False)
+    limitations_json: Mapped[str] = mapped_column(Text, nullable=False)
+    components_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+
+
 class SubmissionProviderMetadata(Base):
     __tablename__ = "submission_provider_metadata"
 
@@ -306,3 +351,24 @@ class SubmissionProviderMetadata(Base):
     )
     source_name: Mapped[str] = mapped_column(String(100), nullable=False)
     metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class ClusterFeedback(Base):
+    """Reviewer accept/reject reasoning for a pipeline opportunity cluster."""
+
+    __tablename__ = "cluster_feedback"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cluster_id: Mapped[int] = mapped_column(
+        ForeignKey("problem_clusters.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    decision: Mapped[str] = mapped_column(String(10), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    reviewer: Mapped[str] = mapped_column(String(100), default="reviewer")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        nullable=False,
+    )

@@ -1,3 +1,6 @@
+import json
+import inspect
+
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
@@ -8,7 +11,14 @@ from app.services.gemini import (
     GeminiRateLimitError,
     analyze_submission,
 )
-from app.models import Submission, SubmissionProviderMetadata
+from app.clustering import canonicalize_url
+from app.commercial_evidence import validate_evidence_claims
+from app.models import (
+    SourceObservation,
+    Submission,
+    SubmissionProviderMetadata,
+)
+from app.source_roles import permitted_item_roles
 
 
 def analyze_pending_batch(
@@ -63,6 +73,7 @@ def analyze_pending_batch(
     }
 
     for submission in pending:
+        claim_diagnostics = None
         if before_item is not None:
             before_item()
         claimed = db.execute(
@@ -107,7 +118,74 @@ def analyze_pending_batch(
                 )
                 if provider_metadata is not None:
                     source_context = provider_metadata.metadata_json
-            if source_context:
+            try:
+                supplied_context = json.loads(source_context or "{}")
+            except (TypeError, json.JSONDecodeError):
+                supplied_context = {}
+            if not isinstance(supplied_context, dict):
+                supplied_context = {}
+            observation = db.scalar(
+                select(SourceObservation)
+                .where(SourceObservation.submission_id == submission.id)
+                .order_by(SourceObservation.id.desc())
+            )
+            if not isinstance(observation, SourceObservation):
+                observation = None
+            observation_metadata = {}
+            if observation is not None:
+                try:
+                    observation_metadata = json.loads(
+                        observation.metadata_json or "{}"
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    observation_metadata = {}
+            if not isinstance(observation_metadata, dict):
+                observation_metadata = {}
+            policy_url = supplied_context.get("feed") or observation_metadata.get("feed")
+            allowed_roles = sorted(
+                permitted_item_roles(submission.source_name, policy_url)
+            )
+            source_context_data = {
+                **supplied_context,
+                "evidence_claim_policy": {
+                    "permitted_roles": allowed_roles,
+                    "source_item_id": (
+                        observation.native_id
+                        if observation and observation.native_id
+                        else submission.id
+                    ),
+                    "canonical_url": (
+                        observation.canonical_url
+                        if observation
+                        else canonicalize_url(
+                            getattr(submission, "source_url", None)
+                        )
+                    ),
+                    "publication_date": (
+                        observation.source_created_at.isoformat()
+                        if observation and observation.source_created_at
+                        else None
+                    ),
+                },
+                "evidence_text_components": {
+                    key: observation_metadata.get(key)
+                    for key in ("title", "description", "transcript_text")
+                    if observation_metadata.get(key)
+                },
+            }
+            source_context = json.dumps(source_context_data)
+            try:
+                analyzer_parameters = inspect.signature(analyzer).parameters
+            except (TypeError, ValueError):
+                analyzer_parameters = {}
+            accepts_source_context = (
+                "source_context" in analyzer_parameters
+                or any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in analyzer_parameters.values()
+                )
+            )
+            if accepts_source_context:
                 extraction, model_name = analyzer(
                     submission.text,
                     submission.source_name,
@@ -119,6 +197,74 @@ def analyze_pending_batch(
                     submission.text,
                     submission.source_name,
                     submission.language,
+                )
+            proposals = []
+            for proposal in getattr(extraction, "evidence_claims", []):
+                if isinstance(proposal, dict):
+                    proposals.append(proposal)
+                elif hasattr(proposal, "model_dump"):
+                    proposals.append(proposal.model_dump())
+                else:
+                    proposals.append(proposal)
+            claim_diagnostics = {
+                "proposed": len(proposals),
+                "accepted": 0,
+                "rejected": [],
+                "duplicate_claims": 0,
+            }
+            if proposals:
+                claims, claim_diagnostics = validate_evidence_claims(
+                    proposals,
+                    source_name=submission.source_name,
+                    source_text=submission.text,
+                    policy_url=policy_url,
+                    source_item_id=(
+                        observation.native_id
+                        if observation and observation.native_id
+                        else submission.id
+                    ),
+                    submission_id=submission.id,
+                    source_url=(
+                        observation.source_url
+                        if observation
+                        else getattr(submission, "source_url", None) or ""
+                    ),
+                    canonical_url=(
+                        observation.canonical_url
+                        if observation
+                        else canonicalize_url(
+                            getattr(submission, "source_url", None)
+                        ) or ""
+                    ),
+                    publication_date=(
+                        observation.source_created_at
+                        if observation
+                        else None
+                    ),
+                    evidence_context=observation_metadata,
+                    analysis_classification={
+                        "is_genuine_problem": getattr(
+                            extraction,
+                            "is_genuine_problem",
+                            False,
+                        ),
+                        "signal_type": getattr(extraction, "signal_type", None),
+                        "filter_reason_code": getattr(
+                            extraction,
+                            "filter_reason_code",
+                            None,
+                        ),
+                    },
+                )
+            else:
+                claims = []
+            if observation is not None:
+                observation_metadata["commercial_evidence_claims"] = claims
+                observation_metadata["commercial_claim_diagnostics"] = claim_diagnostics
+                observation.metadata_json = json.dumps(observation_metadata)
+            if proposals and hasattr(extraction, "model_copy"):
+                extraction = extraction.model_copy(
+                    update={"evidence_claims": []}
                 )
             submission.analysis_json = extraction.model_dump_json()
             submission.model_name = model_name
@@ -175,6 +321,11 @@ def analyze_pending_batch(
             "submission_id": submission.id,
             "status": submission.analysis_status,
             "error": submission.analysis_error,
+            **(
+                {"commercial_claim_diagnostics": claim_diagnostics}
+                if isinstance(claim_diagnostics, dict)
+                else {}
+            ),
         })
 
     return results

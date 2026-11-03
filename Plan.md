@@ -1,4 +1,11 @@
 AI Labs Problem Discovery — Master Implementation Brief
+
+> **HISTORICAL.** Product intent, India-first scope, source permissions, local-model
+> policy, acceptance, and deadline are defined only in
+> [`MASTER_SPECIFICATION.md`](MASTER_SPECIFICATION.md). Prefer that file over this
+> brief wherever they disagree (especially Gemini-first assumptions and generic
+> founder Top-10 / revenue framing).
+
 0. Mission
 Build a working, local-first problem and opportunity discovery engine that can eventually serve multiple publisher/client verticals.
 The product must discover genuine unmet needs from public online discussions, extract structured evidence, merge reports about the same underlying problem, avoid counting duplicates as demand, and rank promising opportunities for human investigation.

@@ -3,6 +3,13 @@ Version 1.0 | 18 October 2026
 Repository: `Mainaryanhoon/ai-labs-problem-discovery`
 Product reference: Razorpay Fix My Itch screenshots, used as design inspiration only.
 
+> **HISTORICAL.** Canonical product specification:
+> [`../MASTER_SPECIFICATION.md`](../MASTER_SPECIFICATION.md).
+> Tatvic Labs / India-first / LiteLLM-primary / 5–10 opportunities (≤6 CEO shortlist).
+> Optional email is **Gmail API only** (master §7.1); SMTP notes below are obsolete.
+> Living gaps: [`IMPLEMENTATION_GAP_REPORT.md`](IMPLEMENTATION_GAP_REPORT.md).
+> Treat Gemini-first architecture notes below as outdated unless the master is revised.
+
 ## 1. Goal
 Collect public and voluntary signals, remove noise, extract normalized problem statements, merge similar problems across sources, rank clusters transparently and show evidence behind the Top 10. The ranked unit is a problem cluster, not a post. This is our own implementation; Razorpay's private code and exact score formula are not known.
 

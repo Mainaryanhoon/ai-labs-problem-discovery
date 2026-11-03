@@ -8,6 +8,7 @@ from app.config import get_settings
 from app.db import engine, get_db, initialize_database
 from app.models import (
     ClusterEvidence,
+    ClusterFeedback,
     PipelineRun,
     PipelineRunSubmission,
     PipelineSubmissionState,
@@ -36,7 +37,12 @@ from typing import Literal
 from app.ranking import (
     ACTIONABLE_SIGNAL_TYPES,
     SUPPORTING_RELATIONSHIPS,
-    score_opportunity,
+)
+from app.tatvic_scoring import (
+    count_distinct_authors,
+    count_records_in_window,
+    load_policy_context,
+    score_tatvic_opportunity,
 )
 from app.services.analysis import analyze_pending_batch
 from app.pipeline_schemas import PipelineRunRequest
@@ -51,6 +57,9 @@ from app.social_ingestion import (
     collect_x,
     router as social_ingestion_router,
 )
+from app.youtube_ingestion import router as youtube_ingestion_router
+from app.article_ingestion import router as article_ingestion_router
+from app.docs_ingestion import router as docs_ingestion_router
 
 from app.cluster_schemas import (
     ClusterCreate,
@@ -60,6 +69,9 @@ from app.cluster_schemas import (
     EvidenceRead,
 )
 from app.operator_schemas import (
+    ClusterFeedbackCreate,
+    ClusterFeedbackRead,
+    LeadListRead,
     OpportunityListRead,
     OpportunitySummaryRead,
     PipelineRunListRead,
@@ -78,11 +90,15 @@ from app.operator_schemas import (
     WeeklyTrendRead,
 )
 from app.services.rankings import (
+    create_monthly_snapshot,
     create_weekly_snapshot,
+    get_monthly_snapshot,
     get_weekly_snapshot,
+    list_monthly_snapshots,
     list_weekly_snapshots,
     weekly_trend,
 )
+from app.services.ceo_report import generate_and_email_monthly_report
 
 
 logging.basicConfig(level=logging.INFO)
@@ -238,6 +254,9 @@ def _evidence_provenance_rows(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import app.leads.models  # noqa: F401 — lead tables
+    import app.models  # noqa: F401 — cluster_feedback and core tables
+
     initialize_database(engine)
     yield
 
@@ -279,8 +298,27 @@ async def protect_api_documentation(request: Request, call_next):
 
 app.include_router(ingestion_router)
 app.include_router(social_ingestion_router)
+app.include_router(youtube_ingestion_router)
+app.include_router(docs_ingestion_router)
+app.include_router(article_ingestion_router)
 
 
+
+
+@app.get("/")
+def root():
+    """API has no UI at /. Use /health, /docs, or the Vite frontend."""
+    return {
+        "service": "ai-labs-problem-discovery",
+        "status": "ok",
+        "health": "/health",
+        "docs": "/docs",
+        "frontend": "http://localhost:5173",
+        "note": (
+            "This is the API only. Open the Vite app for the dashboard, "
+            "or /docs for interactive endpoints."
+        ),
+    }
 
 
 @app.get("/health")
@@ -490,6 +528,16 @@ def list_clusters(
     ).all()
 
 
+@app.get("/api/policy/tatvic")
+def get_tatvic_policy():
+    from app.tatvic_scoring import WEIGHT_VERSION
+
+    return {
+        "weight_version": WEIGHT_VERSION,
+        **load_policy_context(),
+    }
+
+
 @app.get("/api/opportunities", response_model=OpportunityListRead)
 def list_opportunities(
     limit: int = Query(default=25, ge=1, le=100),
@@ -503,6 +551,13 @@ def list_opportunities(
     ),
     min_score: float | None = Query(default=None, ge=0, le=100),
     max_score: float | None = Query(default=None, ge=0, le=100),
+    product_ready_only: bool = Query(
+        default=True,
+        description=(
+            "When true (default), only ASSETS.md productizable opportunities "
+            "with KEEP_DEMAND evidence and a clear offering angle are listed."
+        ),
+    ),
     sort_by: Literal[
         "score",
         "title",
@@ -524,6 +579,8 @@ def list_opportunities(
         statement = statement.where(ProblemCluster.category == category)
     if status is not None:
         statement = statement.where(ProblemCluster.status == status)
+    else:
+        statement = statement.where(ProblemCluster.status != "rejected")
     clusters = db.scalars(
         statement.order_by(ProblemCluster.id.asc())
     ).all()
@@ -532,6 +589,12 @@ def list_opportunities(
         build_opportunity_summary(cluster.id, db)
         for cluster in clusters
     ]
+    if product_ready_only:
+        summaries = [
+            item
+            for item in summaries
+            if item.get("product_ready") is True and item.get("score") is not None
+        ]
     if evidence_level is not None:
         summaries = [
             item
@@ -573,6 +636,143 @@ def list_opportunities(
         "total": total,
         "limit": limit,
         "offset": offset,
+    }
+
+
+def _lead_dashboard_row(lead) -> dict:
+    from app.leads.models import Lead
+
+    if not isinstance(lead, Lead):
+        raise TypeError("expected Lead")
+    quotes = json.loads(lead.evidence_quotes_json or "[]")
+    if not isinstance(quotes, list):
+        quotes = []
+    citations = [q for q in quotes if isinstance(q, str) and q.strip()]
+    extra = json.loads(lead.corroborating_urls_json or "[]")
+    if not isinstance(extra, list):
+        extra = []
+    corroborating = [
+        url.strip()
+        for url in extra
+        if isinstance(url, str) and url.strip().startswith(("http://", "https://"))
+    ]
+    delivery = (lead.delivery_type or "unclear").casefold()
+    if delivery not in {"service", "product", "unclear"}:
+        delivery = "unclear"
+    source_url = lead.source_url if isinstance(lead.source_url, str) else None
+    if source_url and not source_url.startswith(("http://", "https://")):
+        source_url = None
+    return {
+        "cluster_id": lead.id,
+        "lead_id": lead.id,
+        "title": lead.title,
+        "category": lead.company,
+        "status": lead.status,
+        "created_at": lead.first_seen,
+        "score": lead.score,
+        "evidence_level": "lead",
+        "why_now": lead.why_now,
+        "first_customer_reach_strategy": lead.first_customer_route,
+        "delivery_type": delivery,
+        "problem_statement": lead.problem,
+        "smallest_first_version": lead.smallest_first_version,
+        "source_url": source_url,
+        "corroborating_urls": corroborating,
+        "evidence_quotes": citations[:3],
+        "raw_attached_record_count": 1,
+        "unique_evidence_count": max(1, len(citations)),
+        "evidence_citations": citations[:3],
+    }
+
+
+@app.get("/api/leads", response_model=LeadListRead)
+def list_leads(
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+):
+    from app.leads.models import Lead
+
+    active = Lead.status != "rejected"
+    rows = db.scalars(
+        select(Lead)
+        .where(active)
+        .order_by(Lead.score.desc(), Lead.id.desc())
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    total = db.scalar(select(func.count()).select_from(Lead).where(active)) or 0
+    return {
+        "items": [_lead_dashboard_row(row) for row in rows],
+        "total": int(total),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.post(
+    "/api/clusters/{cluster_id}/feedback",
+    response_model=ClusterFeedbackRead,
+    status_code=201,
+)
+def record_cluster_feedback(
+    cluster_id: int,
+    payload: ClusterFeedbackCreate,
+    db: Session = Depends(get_db),
+):
+    from app.leads.models import Lead
+    from app.leads.service import record_feedback
+
+    reason = payload.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="A non-empty reason is required.")
+
+    lead = db.get(Lead, cluster_id)
+    if lead is not None:
+        lead_id = lead.id
+        try:
+            record_feedback(
+                db,
+                lead_id,
+                payload.decision,
+                reason,
+                payload.reviewer or "ui",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "cluster_id": cluster_id,
+            "lead_id": lead_id,
+            "decision": payload.decision,
+            "reason": reason,
+            "reviewer": payload.reviewer or "ui",
+            "recorded": True,
+        }
+
+    cluster = db.get(ProblemCluster, cluster_id)
+    if cluster is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Lead or problem cluster not found.",
+        )
+
+    cluster.status = payload.decision
+    db.add(
+        ClusterFeedback(
+            cluster_id=cluster_id,
+            decision=payload.decision,
+            reason=reason,
+            reviewer=payload.reviewer or "ui",
+        )
+    )
+    db.commit()
+    return {
+        "cluster_id": cluster_id,
+        "lead_id": None,
+        "decision": payload.decision,
+        "reason": reason,
+        "reviewer": payload.reviewer or "ui",
+        "recorded": True,
     }
 
 
@@ -621,6 +821,52 @@ def read_weekly_ranking_trend(
     if db.get(ProblemCluster, cluster_id) is None:
         raise HTTPException(status_code=404, detail="Problem cluster not found.")
     return weekly_trend(db, cluster_id, weeks=weeks)
+
+
+@app.post("/api/rankings/monthly/snapshots")
+def create_monthly_ranking_snapshot(
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    return create_monthly_snapshot(
+        db,
+        build_opportunity_summary,
+        force=force,
+    )
+
+
+@app.get("/api/rankings/monthly/snapshots")
+def list_monthly_ranking_snapshots(
+    limit: int = Query(default=12, ge=1, le=36),
+    db: Session = Depends(get_db),
+):
+    return list_monthly_snapshots(db, limit=limit)
+
+
+@app.get("/api/rankings/monthly/snapshots/{month_start}")
+def read_monthly_ranking_snapshot(
+    month_start: date,
+    db: Session = Depends(get_db),
+):
+    snapshot = get_monthly_snapshot(db, month_start)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Monthly snapshot not found.")
+    return snapshot
+
+
+@app.post("/api/reports/monthly/ceo")
+def generate_monthly_ceo_report(
+    send_email: bool = Query(default=True),
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    """Primary executive deliverable: Top-6 report (+ optional Gmail API email)."""
+    return generate_and_email_monthly_report(
+        db,
+        build_opportunity_summary,
+        send_email=send_email,
+        force=force,
+    )
 
 
 @app.get("/api/clusters/{cluster_id}", response_model=ClusterDetail)
@@ -799,6 +1045,34 @@ def build_opportunity_summary(
             "updated_at": cluster.updated_at,
             "score": None,
             "evidence_level": "insufficient_analyzed_evidence",
+            "weight_version": None,
+            "section": None,
+            "score_components": {},
+            "score_component_contributions": {},
+            "top10_eligible": False,
+            "product_ready": False,
+            "single_source_capped": False,
+            "offering_angle": "undetermined",
+            "smallest_first_version": None,
+            "first_client_type": None,
+            "why_now": None,
+            "first_customer_reach_strategy": None,
+            "delivery_type": "unclear",
+            "failure_risk_line": None,
+            "demand_metrics": {},
+            "supporting_capability_evidence_count": 0,
+            "role_blocked_keep_demand": [],
+            "commercial_qualification": {
+                "india_relevance": "none",
+                "company_level_available": False,
+                "is_commercial_lead": False,
+                "is_validated_problem_opportunity": False,
+            },
+            "commercial_score_v02": {
+                "score": None,
+                "weight_version": "v0.2-commercial",
+                "active_for_ranking": False,
+            },
             "raw_attached_record_count": raw_attached_record_count,
             "analyzed_submission_count": analyzed_record_count,
             "unique_evidence_count": len(unique_records),
@@ -809,6 +1083,7 @@ def build_opportunity_summary(
             "distinct_source_records": 0,
             "eligible_distinct_source_record_count": 0,
             "unique_source_platform_count": len(source_platforms),
+            "unique_demand_platform_count": 0,
             "recorded_independent_records": 0,
             "verified_independent_records": 0,
             "verified_independent_source_count": 0,
@@ -834,40 +1109,160 @@ def build_opportunity_summary(
 
     # Non-supporting and unknown relationship types stay visible in provenance
     # and counts but cannot affect scores or commercial signals.
+    # Source role (SOURCES.md) governs demand floor — not the model KEEP label.
+    from app.source_roles import (
+        is_capability_or_context_role,
+        is_demand_role,
+        is_market_lead_role,
+        role_diagnostics,
+        source_role,
+    )
+    from app.tatvic_scoring import (
+        KEEP_CODES_FOR_DEMAND,
+        KEEP_CODES_FOR_MARKET_LEAD,
+        is_non_product_problem,
+    )
+
+    feed_by_submission_id: dict[int, str] = {}
+    observation_submission_ids = [submission.id for _, submission, _, _ in unique_records]
+    if observation_submission_ids:
+        for observation in db.scalars(
+            select(SourceObservation).where(
+                SourceObservation.submission_id.in_(observation_submission_ids)
+            )
+        ).all():
+            try:
+                metadata = json.loads(observation.metadata_json or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            feed = metadata.get("feed")
+            if isinstance(feed, str) and feed.strip():
+                feed_by_submission_id[observation.submission_id] = feed.strip()
+
+    def _policy_url(submission) -> str | None:
+        return feed_by_submission_id.get(submission.id)
+
+    def _passes_base_gates(
+        record,
+        *,
+        keep_codes: frozenset[str],
+        skip_non_product: bool = False,
+    ) -> bool:
+        link, submission, analysis, _source_record = record
+        if link.relationship_type not in SUPPORTING_RELATIONSHIPS:
+            return False
+        idea_context = analysis.get("filter_reason_code") == "N1_IDEA_CONTEXT"
+        genuine_ok = analysis.get("is_genuine_problem") is True or (
+            skip_non_product and idea_context
+        )
+        return (
+            genuine_ok
+            and isinstance(analysis.get("signal_type"), str)
+            and analysis.get("signal_type") in ACTIONABLE_SIGNAL_TYPES
+            and analysis.get("filter_reason_code") in keep_codes
+            and (
+                skip_non_product
+                or not is_non_product_problem(
+                    cluster.title,
+                    analysis.get("problem_statement"),
+                    submission.text,
+                )
+            )
+        )
+
+    _capability_keep_codes = frozenset({
+        "KEEP_DEMAND",
+        "KEEP_CAPABILITY",
+        "SUPPORTING_ONLY",
+    })
+
+    forum_demand_submission_ids: set[int] = set()
+    forum_submission_ids = [
+        submission.id
+        for _, submission, _, _ in unique_records
+        if submission.source_name.casefold().startswith("google developer forums")
+    ]
+    if forum_submission_ids:
+        from app.commercial_evidence import revalidate_stored_claims
+
+        for observation in db.scalars(
+            select(SourceObservation).where(
+                SourceObservation.submission_id.in_(forum_submission_ids)
+            )
+        ).all():
+            submission = next(
+                (
+                    item
+                    for _, item, _, _ in unique_records
+                    if item.id == observation.submission_id
+                ),
+                None,
+            )
+            if submission is None:
+                continue
+            claims, _diagnostics = revalidate_stored_claims(
+                observation,
+                submission,
+            )
+            if any(claim.get("role") == "demand" for claim in claims):
+                forum_demand_submission_ids.add(submission.id)
+
+    def _demand_eligible_source(record) -> bool:
+        submission = record[1]
+        if is_market_lead_role(submission.source_name, _policy_url(submission)):
+            return True
+        if submission.source_name.casefold().startswith("google developer forums"):
+            return (
+                is_demand_role(submission.source_name)
+                and submission.id in forum_demand_submission_ids
+            )
+        return is_demand_role(submission.source_name)
+
+    def _keep_codes_for(record) -> frozenset[str]:
+        submission = record[1]
+        if is_market_lead_role(submission.source_name, _policy_url(submission)):
+            return KEEP_CODES_FOR_MARKET_LEAD
+        return KEEP_CODES_FOR_DEMAND
+
+    # Demand-floor candidates: demand-role sources, plus market/idea leads.
     eligible_records = [
         record
         for record in unique_records
-        if record[0].relationship_type in SUPPORTING_RELATIONSHIPS
-        and record[2].get("is_genuine_problem") is True
-        and isinstance(record[2].get("signal_type"), str)
-        and record[2].get("signal_type") in ACTIONABLE_SIGNAL_TYPES
+        if _passes_base_gates(
+            record,
+            keep_codes=_keep_codes_for(record),
+            skip_non_product=is_market_lead_role(
+                record[1].source_name,
+                _policy_url(record[1]),
+            ),
+        )
+        and _demand_eligible_source(record)
+    ]
+    # Capability / context corroboration (never inflate demand counts).
+    supporting_capability_records = [
+        record
+        for record in unique_records
+        if _passes_base_gates(record, keep_codes=_capability_keep_codes)
+        and is_capability_or_context_role(record[1].source_name)
+    ]
+    # KEEP_DEMAND labels on non-demand / unknown roles — visible diagnostics only.
+    role_blocked_keep_demand = [
+        {
+            **role_diagnostics(record[1].source_name),
+            "submission_id": record[1].id,
+            "filter_reason_code": record[2].get("filter_reason_code"),
+            "note": (
+                "Model KEEP_DEMAND ignored for demand floor because source "
+                f"role is {source_role(record[1].source_name)!r}."
+            ),
+        }
+        for record in unique_records
+        if _passes_base_gates(record, keep_codes=_keep_codes_for(record))
+        and not _demand_eligible_source(record)
     ]
     for link, submission, _analysis, source_record in eligible_records:
         if source_record is not None:
             eligible_distinct_source_records.add(source_record)
-
-    # A lower median keeps an even-sized tie conservative and deterministic.
-    def median_score(key: str) -> int | None:
-        record_values = [
-            value
-            for _, _, item, _ in eligible_records
-            if isinstance(
-                value := item.get(key), int
-            )
-            and not isinstance(value, bool)
-            and 1 <= value <= 5
-        ]
-        if not record_values:
-            return None
-        values = sorted(
-            value
-            if isinstance(value := item.get(key), int)
-            and not isinstance(value, bool)
-            and 1 <= value <= 5
-            else 1
-            for _, _, item, _ in eligible_records
-        )
-        return values[(len(values) - 1) // 2]
 
     willingness_signals = []
     evidence_quotes = []
@@ -972,31 +1367,49 @@ def build_opportunity_summary(
         and reason.strip()
     ))[:3]
 
-    aggregate_analysis = {
-        "is_genuine_problem": bool(eligible_records),
-        "signal_type": (
-            eligible_records[0][2].get("signal_type")
-            if eligible_records
-            else "general_discussion"
-        ),
-        "urgency_1_to_5": median_score("urgency_1_to_5"),
-        "frequency_signal_1_to_5": median_score(
-            "frequency_signal_1_to_5"
-        ),
-        "evidence_strength_1_to_5": median_score(
-            "evidence_strength_1_to_5"
-        ),
-        "willingness_to_pay_signal": commercial_signal,
-        "evidence_quotes": evidence_quotes,
-        "software_buildability": software_buildability,
+    eligible_analyses = [record[2] for record in eligible_records]
+    eligible_submissions = [record[1] for record in eligible_records]
+    eligible_platforms = {
+        submission.source_name
+        for _link, submission, _analysis, _ in eligible_records
     }
-
-    result = score_opportunity(
-        aggregate_analysis,
-        distinct_sources=len(eligible_distinct_source_records),
-        verified_independent_sources=0,
-        source_timestamped_records_7d=source_timestamped_records_7d,
+    section_votes: dict[str, int] = {}
+    for analysis in eligible_analyses:
+        section = analysis.get("section")
+        if isinstance(section, str) and section.strip():
+            section_votes[section] = section_votes.get(section, 0) + 1
+    primary_section = (
+        max(section_votes, key=section_votes.get)
+        if section_votes
+        else cluster.category
     )
+
+    now = datetime.now(timezone.utc)
+    records_last_30d = count_records_in_window(
+        eligible_submissions, end=now, days=30
+    )
+    records_prior_30d = count_records_in_window(
+        eligible_submissions,
+        end=now - timedelta(days=30),
+        days=30,
+    )
+
+    tatvic = score_tatvic_opportunity(
+        eligible_analyses=eligible_analyses,
+        submissions=eligible_submissions,
+        source_platforms=eligible_platforms,
+        item_count=len(eligible_records),
+        distinct_authors=count_distinct_authors(eligible_submissions),
+        records_last_30d=records_last_30d,
+        records_prior_30d=records_prior_30d,
+        primary_section=primary_section,
+        cluster_title=cluster.title,
+    )
+    display_score = tatvic.score
+    if software_buildability == "unlikely":
+        display_score = None
+    elif primary_section == "OUT_OF_SCOPE":
+        display_score = None
 
     commercial_signal_limitation = (
         "This model-reported signal occurs in at least one eligible record, "
@@ -1006,6 +1419,152 @@ def build_opportunity_summary(
         else "No eligible record establishes purchase intent."
     )
 
+    from app.commercial_qualification import build_commercial_qualification
+    from app.commercial_scoring import score_commercial_opportunity_v02
+
+    commercial_claims = []
+    commercial_claim_diagnostics = {
+        "proposed": 0,
+        "accepted": 0,
+        "rejected": [],
+        "duplicate_claims": 0,
+    }
+    evidence_submission_ids = [
+        submission.id for _, submission, _, _ in unique_records
+    ]
+    unique_submission_by_id = {
+        submission.id: submission
+        for _, submission, _, _ in unique_records
+    }
+    if evidence_submission_ids:
+        from app.commercial_evidence import revalidate_stored_claims
+
+        for observation in db.scalars(
+            select(SourceObservation).where(
+                SourceObservation.submission_id.in_(evidence_submission_ids)
+            )
+        ).all():
+            try:
+                metadata = json.loads(observation.metadata_json or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            submission = unique_submission_by_id.get(observation.submission_id)
+            if submission is None:
+                continue
+            accepted, diagnostics = revalidate_stored_claims(
+                observation,
+                submission,
+            )
+            commercial_claims.extend(accepted)
+            commercial_claim_diagnostics["proposed"] += diagnostics["proposed"]
+            commercial_claim_diagnostics["accepted"] += diagnostics["accepted"]
+            commercial_claim_diagnostics["duplicate_claims"] += diagnostics[
+                "duplicate_claims"
+            ]
+            commercial_claim_diagnostics["rejected"].extend(
+                {
+                    **item,
+                    "submission_id": submission.id,
+                    "source_url": observation.source_url,
+                }
+                for item in diagnostics["rejected"]
+            )
+
+    supporting_capability_count = len(supporting_capability_records)
+    demand_metrics = {
+        **tatvic.demand_metrics,
+        "demand_role_item_count": len(eligible_records),
+        "supporting_capability_item_count": supporting_capability_count,
+        "role_blocked_keep_demand_count": len(role_blocked_keep_demand),
+    }
+    commercial_qualification = build_commercial_qualification(
+        cluster_title=cluster.title,
+        section=tatvic.section,
+        offering_angle=tatvic.offering_angle,
+        smallest_first_version=tatvic.smallest_first_version,
+        first_client_type=tatvic.first_client_type,
+        failure_risk_line=tatvic.failure_risk_line,
+        demand_analyses=eligible_analyses,
+        demand_submissions=eligible_submissions,
+        india_evidence_claims=[
+            claim
+            for claim in commercial_claims
+            if claim.get("role") == "india_evidence"
+        ],
+        commercial_claims=commercial_claims,
+        commercial_claim_diagnostics=commercial_claim_diagnostics,
+        evidence_submissions=[
+            submission
+            for _, submission, _, _ in unique_records
+        ],
+        supporting_capability_count=supporting_capability_count,
+        product_ready=tatvic.product_ready,
+    )
+    # v0.2 is computed for inspection only — never replaces active v0.1 score.
+    commercial_v02 = score_commercial_opportunity_v02(
+        demand_analyses=eligible_analyses,
+        demand_submissions=eligible_submissions,
+        supporting_capability_count=supporting_capability_count,
+        product_ready=tatvic.product_ready,
+        offering_angle=tatvic.offering_angle,
+        qualification=commercial_qualification,
+    )
+
+    def report_evidence(records):
+        record_ids = [record[1].id for record in records]
+        observation_by_submission = {}
+        if record_ids:
+            observation_by_submission = {
+                observation.submission_id: observation
+                for observation in db.scalars(
+                    select(SourceObservation).where(
+                        SourceObservation.submission_id.in_(record_ids)
+                    )
+                ).all()
+            }
+        rows = []
+        for _link, submission, analysis, _source_record in records:
+            quotes = analysis.get("evidence_quotes")
+            if not isinstance(quotes, list):
+                continue
+            observation = observation_by_submission.get(submission.id)
+            valid_quotes = [
+                quote
+                for quote in quotes
+                if isinstance(quote, str)
+                and quote.strip()
+                and quote in (submission.text or "")
+            ][:2]
+            for quote in valid_quotes:
+                rows.append({
+                    "submission_id": submission.id,
+                    "source_name": submission.source_name,
+                    "source_url": (
+                        observation.canonical_url
+                        if observation
+                        else submission.source_url
+                    ),
+                    "source_date": (
+                        observation.source_created_at.isoformat()
+                        if observation and observation.source_created_at
+                        else submission.created_at.isoformat()
+                        if submission.created_at
+                        else None
+                    ),
+                    "evidence_quote": quote,
+                    "classification_reason": (
+                        analysis.get("filter_reason_sentence")
+                        or analysis.get("filter_reason_code")
+                        or "Validated by source role and existing problem analysis."
+                    ),
+                })
+        return rows
+
+    demand_evidence = report_evidence(eligible_records)
+    capability_context_evidence = report_evidence(
+        supporting_capability_records
+    )
+
     return {
         "cluster_id": cluster.id,
         "title": cluster.title,
@@ -1013,11 +1572,63 @@ def build_opportunity_summary(
         "status": cluster.status,
         "created_at": cluster.created_at,
         "updated_at": cluster.updated_at,
-        "score": result.score,
-        "evidence_level": result.evidence_level,
-        "software_buildability": result.software_buildability,
+        "score": display_score,
+        "evidence_level": tatvic.evidence_level,
+        "weight_version": tatvic.weight_version,
+        "section": tatvic.section,
+        "score_components": tatvic.components,
+        "score_component_contributions": tatvic.component_contributions,
+        "top10_eligible": tatvic.top10_eligible,
+        "product_ready": tatvic.product_ready,
+        "single_source_capped": tatvic.single_source_capped,
+        "offering_angle": tatvic.offering_angle,
+        "smallest_first_version": tatvic.smallest_first_version,
+        "first_client_type": tatvic.first_client_type,
+        "why_now": next(
+            (
+                value.strip()
+                for _, _, analysis, _ in eligible_records
+                if isinstance((value := analysis.get("why_now")), str)
+                and value.strip()
+            ),
+            None,
+        ),
+        "first_customer_reach_strategy": next(
+            (
+                value.strip()
+                for _, _, analysis, _ in eligible_records
+                if isinstance(
+                    (value := analysis.get("first_customer_reach_strategy")),
+                    str,
+                )
+                and value.strip()
+            ),
+            None,
+        ),
+        "delivery_type": next(
+            (
+                value.strip().casefold()
+                for _, _, analysis, _ in eligible_records
+                if isinstance((value := analysis.get("delivery_type")), str)
+                and value.strip().casefold() in {"service", "product", "unclear"}
+            ),
+            "unclear",
+        ),
+        "failure_risk_line": tatvic.failure_risk_line,
+        "demand_metrics": demand_metrics,
+        "supporting_capability_evidence_count": supporting_capability_count,
+        "demand_evidence": demand_evidence,
+        "capability_context_evidence": capability_context_evidence,
+        "role_blocked_keep_demand": role_blocked_keep_demand,
+        "commercial_qualification": commercial_qualification,
+        "commercial_score_v02": commercial_v02,
+        "software_buildability": software_buildability,
         "software_buildability_reasons": software_buildability_reasons,
-        "eligibility": result.eligibility,
+        "eligibility": (
+            "eligible"
+            if display_score is not None
+            else "review_required"
+        ),
         "source_timestamped_records_7d": source_timestamped_records_7d,
         "raw_attached_record_count": raw_attached_record_count,
         "analyzed_submission_count": analyzed_record_count,
@@ -1032,20 +1643,29 @@ def build_opportunity_summary(
             eligible_distinct_source_records
         ),
         "unique_source_platform_count": len(source_platforms),
+        "unique_demand_platform_count": len(eligible_platforms),
         "recorded_independent_records": len(recorded_independent_records),
         "verified_independent_records": 0,
         "verified_independent_source_count": 0,
         "commercial_signal": commercial_signal,
         "commercial_signal_limitation": commercial_signal_limitation,
-        "reasons": result.reasons,
+        "reasons": tatvic.reasons,
         "evidence_provenance": evidence_provenance,
-        "limitations": result.limitations + [
+        "limitations": tatvic.limitations + [
             *(
                 [
                     "A model-reported purchase-intent signal lacked a "
                     "traceable quote in its source and was treated as unclear."
                 ]
                 if unsupported_commercial_signal
+                else []
+            ),
+            *(
+                [
+                    "One or more KEEP_DEMAND labels on non-demand sources "
+                    "were ignored for the demand floor (SOURCES.md roles)."
+                ]
+                if role_blocked_keep_demand
                 else []
             ),
             "Recorded independence flags have not been verified.",
@@ -1057,6 +1677,8 @@ def build_opportunity_summary(
             "against its source excerpt.",
             "Multiple submissions may still describe the same underlying person or event.",
             "This heuristic is for investigation prioritization, not market validation.",
+            "Active ranking uses weight_version v0.1; commercial_score_v02 is "
+            "informational until owners activate v0.2-commercial.",
         ],
     }
 

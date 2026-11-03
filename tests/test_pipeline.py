@@ -132,8 +132,9 @@ def test_pipeline_validates_sources_and_every_bound(pipeline_env):
         _request(x_limit=26),
         _request(x_limit=49),
         _request(x_limit=51),
-        _request(analysis_limit=31),
-        _request(clustering_limit=31),
+        _request(analysis_limit=101),
+        _request(clustering_limit=101),
+        _request(articles_limit=101),
         _request(stack_exchange_site="bad/site"),
     ]
 
@@ -319,10 +320,12 @@ def test_pipeline_scopes_work_and_run_inspection_to_collected_records(
     assert [call[0] for call in analyzer_calls] == [
         "Small retailers struggle to generate weekly reports."
     ]
-    assert analyzer_calls[0][1]["source_context"] == json.dumps({
-        "is_reply": True,
-        "author": "store_support",
-    })
+    source_context = json.loads(analyzer_calls[0][1]["source_context"])
+    assert source_context["is_reply"] is True
+    assert source_context["author"] == "store_support"
+    assert source_context["evidence_claim_policy"]["permitted_roles"] == [
+        "context"
+    ]
 
     with session_factory() as db:
         assert db.get(Submission, old_pending.id).analysis_status == "pending"
@@ -657,18 +660,21 @@ def test_provider_rate_limit_is_reported_and_does_not_block_other_source(
             detail="Provider rate limit reached; retry later.",
         )
 
-    def collect_x(_limit, db):
-        calls.append("x")
+    def collect_hacker_news(_limit, db):
+        calls.append("hacker_news")
         submission = _add_submission(
             db,
-            text="X users struggle to manage this manual workflow.",
+            text="Analytics teams struggle to manage this manual workflow.",
         )
         result = _collection_result(submission)
-        result["source"] = "X"
+        result["source"] = "Hacker News"
         return result
 
     monkeypatch.setattr("app.services.pipeline.collect_reddit", limited)
-    monkeypatch.setattr("app.services.pipeline.collect_x", collect_x)
+    monkeypatch.setattr(
+        "app.services.pipeline.collect_hacker_news",
+        collect_hacker_news,
+    )
     monkeypatch.setattr(
         "app.main.analyze_submission",
         lambda text, *_args: (_valid_analysis(text), "fake-model"),
@@ -676,14 +682,14 @@ def test_provider_rate_limit_is_reported_and_does_not_block_other_source(
 
     response = client.post(
         "/api/pipeline/run",
-        json=_request(("reddit", "x")),
+        json=_request(("reddit", "hacker_news")),
     )
 
     assert response.status_code == 200
     result = response.json()
-    assert calls == ["reddit", "x"]
+    assert calls == ["reddit", "hacker_news"]
     assert result["collection"]["reddit"]["error_code"] == "rate_limited"
-    assert result["collection"]["x"]["created"] == 1
+    assert result["collection"]["hacker_news"]["created"] == 1
     assert result["analysis"]["completed"] == 1
 
 def test_analysis_rate_limit_preserves_success_and_stops_batch(
@@ -1235,34 +1241,104 @@ def _add_scored_cluster(
     text,
     urgency,
 ):
+    """Create a cluster that is product-ready under RUBRIC/ASSETS gates.
+
+    Ranked opportunities require ≥3 independent KEEP_DEMAND items, ≥2 authors,
+    an in-scope section, a clear offering angle, and known-offering citations.
+    Score differentiation still comes from ``urgency`` (1–5) on commercial /
+    effort / defensibility and uncapped readiness/fit/leverage floors (≥4) so
+    upgrade_existing_offering remains valid. Single demand-role source stays
+    thin so existing evidence_level assertions remain meaningful; source_name
+    must be an approved demand role (model KEEP_DEMAND alone is not enough).
+    """
+    slug = title.replace(" ", "-").lower()
     cluster = ProblemCluster(
         title=title,
-        problem_statement=f"{title} is an ongoing problem for users.",
+        problem_statement=(
+            f"{title}: GA4 purchase totals disagree with store orders, so the "
+            "analytics team reconciles weekly by hand."
+        ),
         category=category,
         status=status,
     )
-    submission = Submission(
-        text=text,
-        source_name="test-source",
-        source_url=f"https://example.test/{title.replace(' ', '-')}",
-        analysis_status="completed",
-        analysis_json=json.dumps({
-            "is_genuine_problem": True,
-            "signal_type": "pain_point",
-            "urgency_1_to_5": urgency,
-            "frequency_signal_1_to_5": urgency,
-            "evidence_strength_1_to_5": urgency,
-            "willingness_to_pay_signal": "none",
-            "software_buildability": "likely",
-            "evidence_quotes": [text[:25]],
-        }),
-    )
-    db.add_all([cluster, submission])
+    db.add(cluster)
     db.flush()
-    db.add(ClusterEvidence(
-        cluster_id=cluster.id,
-        submission_id=submission.id,
-    ))
+
+    # Floor offering components so product_ready stays true across urgency
+    # values used by sort/ranking tests (urgency=1 must still be eligible).
+    readiness = max(4, urgency)
+    fit = max(4, urgency)
+    leverage = max(4, urgency)
+    commercial = max(1, min(5, urgency))
+    effort = max(1, min(5, urgency))
+    defensibility = max(1, urgency - 2)
+
+    for index in range(3):
+        quote = text if len(text) <= 80 else text[:80]
+        body = (
+            f"{text} Independent GA4 reconcile note {index + 1} for "
+            f"{title}: Tag Auditor / BQ Agent style check needed."
+        )
+        submission = Submission(
+            text=body,
+            source_name="Reddit",
+            source_url=f"https://example.test/{slug}/item-{index + 1}",
+            submitted_by=f"analyst-{index + 1}",
+            analysis_status="completed",
+            analysis_json=json.dumps({
+                "is_genuine_problem": True,
+                "signal_type": "pain_point",
+                "problem_statement": (
+                    "GA4 purchases do not match store orders; practitioners "
+                    "reconcile weekly by hand."
+                ),
+                "affected_user": "eCommerce analytics lead",
+                "context": (
+                    "Measurement team compares GA4 ecommerce purchases to the "
+                    "order system because totals disagree."
+                ),
+                "urgency_1_to_5": urgency,
+                "frequency_signal_1_to_5": urgency,
+                "evidence_strength_1_to_5": urgency,
+                "willingness_to_pay_signal": "suggested",
+                "software_buildability": "likely",
+                "software_buildability_reason": (
+                    "Narrow tabular compare of GA4 events to order exports."
+                ),
+                "evidence_quotes": [quote],
+                "section": "Analytics",
+                "vertical": "eCommerce",
+                "item_kind": "demand",
+                "filter_reason_code": "KEEP_DEMAND",
+                "filter_reason_sentence": (
+                    "RUBRIC Gate 3 + ASSETS BQ Agent / Tag Auditor pattern."
+                ),
+                "capability_readiness_1_to_5": readiness,
+                "section_client_fit_1_to_5": fit,
+                "leverage_on_offerings_1_to_5": leverage,
+                "commercial_signal_1_to_5": commercial,
+                "effort_to_first_version_1_to_5": effort,
+                "defensibility_1_to_5": defensibility,
+                "smallest_first_version": (
+                    "BQ Agent / GA Tag Auditor check that compares GA4 "
+                    "purchase events to order exports and emails a drift report"
+                ),
+                "first_client_type": "eCommerce analytics lead",
+                "failure_risk_line": (
+                    "Native GA4 debug tools or a one-off BigQuery job may "
+                    "shrink willingness to buy an agent"
+                ),
+                "tags": ["GA4", "Tag Auditor", "BQ Agent"],
+            }),
+        )
+        db.add(submission)
+        db.flush()
+        db.add(ClusterEvidence(
+            cluster_id=cluster.id,
+            submission_id=submission.id,
+            is_independent=True,
+            relationship_type="supports",
+        ))
     db.commit()
     db.refresh(cluster)
     return cluster
@@ -1314,7 +1390,7 @@ def test_opportunities_sort_scores_before_pagination_and_apply_filters(
         "/api/opportunities",
         params={
             "min_score": 60,
-            "evidence_level": "single_source_candidate",
+            "evidence_level": "thin",
             "limit": 10,
         },
     )
@@ -1668,14 +1744,15 @@ def test_weekly_ranking_snapshots_are_idempotent_and_trends_are_traceable(
             text="A physical infrastructure problem is urgent.",
             urgency=5,
         )
-        excluded_submission = db.scalars(
+        excluded_submissions = db.scalars(
             select(Submission)
             .join(ClusterEvidence)
             .where(ClusterEvidence.cluster_id == excluded.id)
-        ).one()
-        analysis = json.loads(excluded_submission.analysis_json)
-        analysis["software_buildability"] = "unlikely"
-        excluded_submission.analysis_json = json.dumps(analysis)
+        ).all()
+        for excluded_submission in excluded_submissions:
+            analysis = json.loads(excluded_submission.analysis_json)
+            analysis["software_buildability"] = "unlikely"
+            excluded_submission.analysis_json = json.dumps(analysis)
         db.commit()
 
     first_week = date(2026, 10, 19)
@@ -1700,18 +1777,25 @@ def test_weekly_ranking_snapshots_are_idempotent_and_trends_are_traceable(
     }
 
     with session_factory() as db:
-        lower_submission = db.scalars(
+        lower_submissions = db.scalars(
             select(Submission)
             .join(ClusterEvidence)
             .where(ClusterEvidence.cluster_id == lower.id)
-        ).one()
-        analysis = json.loads(lower_submission.analysis_json)
-        analysis.update({
-            "urgency_1_to_5": 5,
-            "frequency_signal_1_to_5": 5,
-            "evidence_strength_1_to_5": 5,
-        })
-        lower_submission.analysis_json = json.dumps(analysis)
+        ).all()
+        for lower_submission in lower_submissions:
+            analysis = json.loads(lower_submission.analysis_json)
+            analysis.update({
+                "urgency_1_to_5": 5,
+                "frequency_signal_1_to_5": 5,
+                "evidence_strength_1_to_5": 5,
+                "capability_readiness_1_to_5": 5,
+                "section_client_fit_1_to_5": 5,
+                "leverage_on_offerings_1_to_5": 5,
+                "commercial_signal_1_to_5": 5,
+                "effort_to_first_version_1_to_5": 5,
+                "defensibility_1_to_5": 5,
+            })
+            lower_submission.analysis_json = json.dumps(analysis)
         db.commit()
 
     monkeypatch.setattr(
@@ -1734,3 +1818,79 @@ def test_weekly_ranking_snapshots_are_idempotent_and_trends_are_traceable(
     assert [point["rank"] for point in trend_points] == [2, 1]
     assert trend_points[1]["rank_change"] == 1
     assert trend_points[1]["score_change"] > 0
+
+
+def test_deferred_clustering_count_in_stage_counts(
+    pipeline_env,
+    monkeypatch,
+):
+    """
+    When more eligible items exist than the clustering_limit,
+    stage_counts["clustering"]["deferred_clustering_count"] must equal
+    len(eligible) - clustering_limit.
+
+    Validates: Requirements 2.5
+    """
+    client, session_factory = pipeline_env
+    created_ids = []
+
+    def collect(_limit, db):
+        for text in (
+            "Retailers struggle to reconcile monthly orders manually.",
+            "Shop owners struggle to track inventory changes daily.",
+            "Analysts struggle to clean messy sales data each week.",
+        ):
+            created_ids.append(_add_submission(db, text=text).id)
+        return {
+            "source": "Hacker News",
+            "fetched": 3,
+            "created": 3,
+            "duplicates_skipped": 0,
+            "irrelevant_skipped": 0,
+            "submission_ids": created_ids.copy(),
+        }
+
+    monkeypatch.setattr("app.services.pipeline.collect_hacker_news", collect)
+    monkeypatch.setattr(
+        "app.main.analyze_submission",
+        lambda text, *_args: (_valid_analysis(text), "fake-model"),
+    )
+
+    def create_cluster(db, submission, **_kwargs):
+        cluster = ProblemCluster(
+            title=f"Problem {submission.id}",
+            problem_statement="A test problem.",
+        )
+        db.add(cluster)
+        db.commit()
+        return {"decision": "created", "cluster_id": cluster.id}
+
+    monkeypatch.setattr(
+        "app.services.pipeline.cluster_submission",
+        create_cluster,
+    )
+
+    # 3 eligible submissions, clustering_limit=1 => deferred_count = 3 - 1 = 2
+    response = client.post(
+        "/api/pipeline/run",
+        json=_request(analysis_limit=3, clustering_limit=1),
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["status"] == "partial"
+    run_id = result["run_id"]
+
+    # Retrieve persisted stage_counts from the run detail endpoint
+    run_detail = client.get(f"/api/pipeline/runs/{run_id}")
+    assert run_detail.status_code == 200
+    stage_counts = run_detail.json()["stage_counts"]
+
+    clustering_counts = stage_counts["clustering"]
+    assert "deferred_clustering_count" in clustering_counts, (
+        "stage_counts['clustering'] must include 'deferred_clustering_count'"
+    )
+    # 3 eligible items, limit=1 => 2 deferred
+    assert clustering_counts["deferred_clustering_count"] == 2, (
+        f"Expected deferred_clustering_count=2, got {clustering_counts['deferred_clustering_count']}"
+    )

@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -148,6 +149,16 @@ def known_native_ids(db: Session, source_name: str) -> set[str]:
         if native_id
     )
     return records
+
+
+def newest_source_created_at(db: Session, source_name: str) -> datetime | None:
+    """Newest stored source timestamp for incremental fetch cursors."""
+    value = db.scalar(
+        select(func.max(SourceObservation.source_created_at)).where(
+            SourceObservation.source_name == source_name
+        )
+    )
+    return value if isinstance(value, datetime) else None
 
 
 def known_observation_urls(db: Session, source_name: str) -> set[str]:

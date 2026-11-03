@@ -7,8 +7,6 @@ from datetime import datetime, timezone
 from unicodedata import normalize as unicode_normalize
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from google import genai
-from google.genai import errors as genai_errors
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
@@ -19,9 +17,10 @@ from app.models import (
     ProblemCluster,
     Submission,
 )
+from app.services.llm import get_embeddings as llm_get_embeddings
 
 
-EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_MODEL = "litellm-or-local-v1"
 
 # Initial operational thresholds, NOT calibrated probabilities.
 # Similarity values must be evaluated against labelled examples before
@@ -237,42 +236,14 @@ def _validate_embedding_vectors(
 
 
 def get_embeddings(texts: list[str]) -> list[list[float]]:
-    """Return semantic embeddings using the project's existing Gemini settings."""
-    settings = get_settings()
-    if not settings.gemini_api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is missing. Check .env and restart the API."
-        )
-
-    client = genai.Client(api_key=settings.gemini_api_key)
+    """Return semantic embeddings via LiteLLM or local deterministic vectors."""
+    get_settings()
     try:
-        response = client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=texts,
-        )
-    except genai_errors.APIError as exc:
+        vectors = llm_get_embeddings(texts)
+    except Exception as exc:
         raise RuntimeError(
-            f"Gemini embedding request failed (HTTP {exc.code})."
+            f"Embedding request failed ({type(exc).__name__})."
         ) from exc
-
-    embeddings = getattr(response, "embeddings", None)
-    if not embeddings or len(embeddings) != len(texts):
-        raise RuntimeError(
-            "Gemini returned an incomplete embedding response."
-        )
-
-    vectors: list[list[float]] = []
-    for item in embeddings:
-        values = getattr(item, "values", None)
-        if not values:
-            raise RuntimeError("Gemini returned an empty embedding.")
-        try:
-            vectors.append(list(values))
-        except TypeError as exc:
-            raise RuntimeError(
-                "Gemini returned an invalid embedding."
-            ) from exc
-
     return _validate_embedding_vectors(vectors, len(texts))
 
 

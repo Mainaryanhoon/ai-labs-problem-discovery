@@ -231,29 +231,9 @@ def test_malformed_embedding_dimensions_fail_without_creating_evidence(
 
 
 def test_embedding_response_with_non_finite_values_is_rejected(monkeypatch):
-    class FakeClient:
-        class Models:
-            @staticmethod
-            def embed_content(**_kwargs):
-                return type(
-                    "Response",
-                    (),
-                    {
-                        "embeddings": [
-                            type("Embedding", (), {"values": [float("inf")]})()
-                        ]
-                    },
-                )()
-
-        models = Models()
-
     monkeypatch.setattr(
-        "app.clustering.get_settings",
-        lambda: type("Settings", (), {"gemini_api_key": "test-key"})(),
-    )
-    monkeypatch.setattr(
-        "app.clustering.genai.Client",
-        lambda **_kwargs: FakeClient(),
+        "app.clustering.llm_get_embeddings",
+        lambda _texts: [[float("inf")]],
     )
 
     with pytest.raises(RuntimeError, match="non-finite or non-numeric"):
@@ -261,49 +241,30 @@ def test_embedding_response_with_non_finite_values_is_rejected(monkeypatch):
 
 
 def test_embedding_provider_error_is_explicit(monkeypatch):
-    from google.genai.errors import ServerError
-
-    class FakeClient:
-        class Models:
-            @staticmethod
-            def embed_content(**_kwargs):
-                raise ServerError(
-                    503,
-                    {"error": {"message": "temporary outage"}},
-                )
-
-        models = Models()
-
     monkeypatch.setattr(
-        "app.clustering.get_settings",
-        lambda: type("Settings", (), {"gemini_api_key": "test-key"})(),
-    )
-    monkeypatch.setattr(
-        "app.clustering.genai.Client",
-        lambda **_kwargs: FakeClient(),
+        "app.clustering.llm_get_embeddings",
+        lambda _texts: (_ for _ in ()).throw(
+            RuntimeError("LiteLLM embeddings failed (HTTP 503).")
+        ),
     )
 
-    with pytest.raises(RuntimeError, match="HTTP 503"):
+    with pytest.raises(RuntimeError, match="Embedding request failed"):
         get_embeddings(["test"])
 
 
-def test_missing_embedding_configuration_fails_before_provider_call(
-    monkeypatch,
-):
+def test_local_embeddings_work_without_remote_provider(monkeypatch):
     class Settings:
-        gemini_api_key = ""
+        litellm_api_key = ""
+        litellm_embedding_model = ""
 
     monkeypatch.setattr(
         "app.clustering.get_settings",
         lambda: Settings(),
     )
-    monkeypatch.setattr(
-        "app.clustering.genai.Client",
-        lambda **_kwargs: pytest.fail("Provider client should not be created"),
-    )
-
-    with pytest.raises(RuntimeError, match="GEMINI_API_KEY is missing"):
-        get_embeddings(["test"])
+    vectors = get_embeddings(["GA4 purchase reconciliation"])
+    assert len(vectors) == 1
+    assert len(vectors[0]) >= 8
+    assert all(isinstance(value, float) for value in vectors[0])
 
 
 

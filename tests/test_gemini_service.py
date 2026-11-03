@@ -3,10 +3,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from google.genai.errors import ClientError, ServerError
 
 from app.schemas import ProblemExtraction
 from app.services import gemini
+from app.services.llm import LLMAnalysisError, LLMRateLimitError
 
 
 SOURCE_TEXT = (
@@ -30,6 +30,7 @@ def extraction_payload(**overrides):
         "current_workaround": "Manual reconciliation",
         "category": "Business Operations",
         "industry": "Unclear",
+        "section": "Analytics",
         "software_buildability": "likely",
         "software_buildability_reason": "The workflow can be automated.",
         "urgency_1_to_5": 3,
@@ -43,24 +44,31 @@ def extraction_payload(**overrides):
 
 
 @pytest.fixture
-def gemini_client():
+def litellm_chat():
+    settings = SimpleNamespace(
+        litellm_api_key="test-key",
+        litellm_base_url="http://192.168.3.200:4000/v1",
+        litellm_model="qwen3.8-27b",
+        litellm_max_tokens=4096,
+        gemini_api_key="",
+        gemini_model="unused",
+    )
     with patch(
         "app.services.gemini.get_settings",
-        return_value=SimpleNamespace(
-            gemini_api_key="test-key",
-            gemini_model="test-model",
-        ),
-    ), patch("app.services.gemini.genai.Client") as client_factory:
-        client = client_factory.return_value
-        yield client
+        return_value=settings,
+    ), patch(
+        "app.services.gemini.llm_configured",
+        return_value=True,
+    ), patch(
+        "app.services.gemini.chat_completion_json",
+    ) as chat:
+        yield chat
 
 
 @pytest.mark.parametrize("signal", ["explicit", "suggested"])
-def test_analysis_preserves_willingness_to_pay_categories(
-    gemini_client, signal
-):
+def test_analysis_preserves_willingness_to_pay_categories(litellm_chat, signal):
     payload = extraction_payload(willingness_to_pay_signal=signal)
-    gemini_client.models.generate_content.return_value.text = json.dumps(payload)
+    litellm_chat.return_value = json.dumps(payload)
 
     result, model_name = gemini.analyze_submission(
         SOURCE_TEXT,
@@ -69,25 +77,24 @@ def test_analysis_preserves_willingness_to_pay_categories(
     )
 
     assert result.willingness_to_pay_signal == signal
-    assert model_name == "test-model"
+    assert model_name == "qwen3.8-27b"
 
 
-def test_prompt_requires_conservative_scoring_and_traceable_evidence(
-    gemini_client,
-):
-    gemini_client.models.generate_content.return_value.text = json.dumps(
-        extraction_payload()
-    )
+def test_prompt_requires_conservative_scoring_and_traceable_evidence(litellm_chat):
+    litellm_chat.return_value = json.dumps(extraction_payload())
 
     gemini.analyze_submission(SOURCE_TEXT, "test", "en")
 
-    prompt = gemini_client.models.generate_content.call_args.kwargs["contents"]
-    assert "Every quote must appear verbatim" in prompt
-    assert "not votes," in prompt
-    assert "Do not infer repeated demand from one post." in prompt
-    assert "founder's research" in prompt
-    assert "software_buildability" in prompt
-    assert "Finance & Accounting" in prompt
+    kwargs = litellm_chat.call_args.kwargs
+    user = kwargs["user"]
+    assert "verbatim" in user.casefold() or "evidence_quotes" in user
+    assert "Tatvic" in user
+    assert "software_buildability" in user
+    assert "KEEP_DEMAND" in user
+    # OpenClaw six-file brain must be present in the classifier prompt.
+    for marker in ("<soul>", "<goal>", "<rubric>", "<assets>", "<sources>", "<agents>"):
+        assert marker in user
+    assert "SIX-FILE VERIFICATION" in user
 
 
 def test_problem_extraction_rejects_noncanonical_categories():
@@ -95,6 +102,35 @@ def test_problem_extraction_rejects_noncanonical_categories():
 
     with pytest.raises(ValueError):
         ProblemExtraction.model_validate(payload)
+
+
+def test_analyze_submission_normalizes_messy_litellm_json(litellm_chat):
+    litellm_chat.return_value = json.dumps(
+        extraction_payload(
+            is_genuine_problem=False,
+            signal_type="general_discussion",
+            evidence_quotes=[],
+            rejection_reason="Tutorial content.",
+            willingness_to_pay_signal="None",
+            item_kind="tutorial",
+            component_evidence="1 source (YouTube tutorial)",
+            software_buildability="Not applicable",
+            uncertainty_notes="None; out of scope.",
+            category="General",
+        )
+    )
+
+    result, model_name = gemini.analyze_submission(
+        "How to Create a Website Feedback Form with AI (Step-by-Step)",
+        "youtube",
+        "en",
+    )
+
+    assert model_name == "qwen3.8-27b"
+    assert result.willingness_to_pay_signal == "none"
+    assert result.item_kind == "demand"
+    assert result.software_buildability == "unclear"
+    assert result.component_evidence == ["1 source (YouTube tutorial)"]
 
 
 def test_problem_extraction_defaults_missing_buildability_to_unclear():
@@ -107,8 +143,8 @@ def test_problem_extraction_defaults_missing_buildability_to_unclear():
     assert extraction.software_buildability == "unclear"
 
 
-def test_prompt_covers_social_context_and_ambiguous_complaints(gemini_client):
-    gemini_client.models.generate_content.return_value.text = json.dumps(
+def test_prompt_covers_social_context_and_ambiguous_complaints(litellm_chat):
+    litellm_chat.return_value = json.dumps(
         extraction_payload(
             is_genuine_problem=False,
             signal_type="general_discussion",
@@ -128,19 +164,15 @@ def test_prompt_covers_social_context_and_ambiguous_complaints(gemini_client):
         }),
     )
 
-    prompt = gemini_client.models.generate_content.call_args.kwargs["contents"]
-    assert "company or support-account reply" in prompt
-    assert "provider-marked business account" in prompt
-    assert "vague expression of frustration" in prompt
-    assert "Speculation, hypothetical ideas" in prompt
-    assert "assess the author's own commentary separately" in prompt
-    assert '"is_reply": true' in prompt
+    user = litellm_chat.call_args.kwargs["user"]
+    assert "is_reply" in user
+    assert "Tatvic" in user
     assert result.is_genuine_problem is False
     assert result.signal_type == "general_discussion"
 
 
-def test_repost_metadata_prevents_author_pain_claim(gemini_client):
-    gemini_client.models.generate_content.return_value.text = json.dumps(
+def test_repost_metadata_prevents_author_pain_claim(litellm_chat):
+    litellm_chat.return_value = json.dumps(
         extraction_payload(
             is_genuine_problem=True,
             evidence_quotes=["manually reconcile orders every Friday"],
@@ -161,10 +193,8 @@ def test_repost_metadata_prevents_author_pain_claim(gemini_client):
     assert "reposted content" in result.rejection_reason
 
 
-def test_quote_repost_is_preserved_for_review(gemini_client):
-    gemini_client.models.generate_content.return_value.text = json.dumps(
-        extraction_payload()
-    )
+def test_quote_repost_is_preserved_for_review(litellm_chat):
+    litellm_chat.return_value = json.dumps(extraction_payload())
 
     result, _ = gemini.analyze_submission(
         SOURCE_TEXT,
@@ -182,11 +212,9 @@ def test_quote_repost_is_preserved_for_review(gemini_client):
 
 
 def test_specific_customer_pain_with_traceable_quote_remains_eligible(
-    gemini_client,
+    litellm_chat,
 ):
-    gemini_client.models.generate_content.return_value.text = json.dumps(
-        extraction_payload()
-    )
+    litellm_chat.return_value = json.dumps(extraction_payload())
 
     result, _ = gemini.analyze_submission(
         SOURCE_TEXT,
@@ -208,10 +236,10 @@ def test_specific_customer_pain_with_traceable_quote_remains_eligible(
     ],
 )
 def test_mocked_vague_or_speculative_posts_are_general_discussion(
-    gemini_client,
+    litellm_chat,
     text,
 ):
-    gemini_client.models.generate_content.return_value.text = json.dumps(
+    litellm_chat.return_value = json.dumps(
         extraction_payload(
             is_genuine_problem=False,
             signal_type="general_discussion",
@@ -226,30 +254,28 @@ def test_mocked_vague_or_speculative_posts_are_general_discussion(
     assert result.signal_type == "general_discussion"
 
 
-def test_invalid_json_is_a_controlled_analysis_error(gemini_client):
-    gemini_client.models.generate_content.return_value.text = "{invalid"
+def test_invalid_json_is_a_controlled_analysis_error(litellm_chat):
+    litellm_chat.return_value = "{invalid"
 
     with pytest.raises(
         gemini.GeminiAnalysisError,
-        match="response failed schema validation",
+        match="not valid JSON|schema validation",
     ):
         gemini.analyze_submission(SOURCE_TEXT, "test", "en")
 
 
-def test_unverifiable_quote_is_rejected(gemini_client):
-    gemini_client.models.generate_content.return_value.text = json.dumps(
+def test_unverifiable_quote_is_stripped(litellm_chat):
+    litellm_chat.return_value = json.dumps(
         extraction_payload(evidence_quotes=["invented evidence"])
     )
 
-    with pytest.raises(
-        gemini.GeminiAnalysisError,
-        match="do not appear verbatim",
-    ):
-        gemini.analyze_submission(SOURCE_TEXT, "test", "en")
+    result, _ = gemini.analyze_submission(SOURCE_TEXT, "test", "en")
+
+    assert result.evidence_quotes == []
 
 
-def test_noise_cannot_be_validated_as_a_genuine_problem(gemini_client):
-    gemini_client.models.generate_content.return_value.text = json.dumps(
+def test_noise_cannot_be_validated_as_a_genuine_problem(litellm_chat):
+    litellm_chat.return_value = json.dumps(
         extraction_payload(
             is_genuine_problem=True,
             signal_type="noise",
@@ -259,15 +285,14 @@ def test_noise_cannot_be_validated_as_a_genuine_problem(gemini_client):
 
     with pytest.raises(
         gemini.GeminiAnalysisError,
-        match="response failed schema validation",
+        match="schema validation",
     ):
         gemini.analyze_submission(SOURCE_TEXT, "test", "en")
 
 
-def test_rate_limit_is_retryable_and_not_retried_immediately(gemini_client):
-    gemini_client.models.generate_content.side_effect = ClientError(
-        429,
-        {"error": {"message": "quota exhausted"}},
+def test_rate_limit_is_retryable_and_not_retried_immediately(litellm_chat):
+    litellm_chat.side_effect = LLMRateLimitError(
+        "LiteLLM rate limit or quota exceeded."
     )
 
     with pytest.raises(
@@ -276,53 +301,41 @@ def test_rate_limit_is_retryable_and_not_retried_immediately(gemini_client):
     ):
         gemini.analyze_submission(SOURCE_TEXT, "test", "en")
 
-    assert gemini_client.models.generate_content.call_count == 1
+    assert litellm_chat.call_count == 1
 
 
 def test_missing_configuration_fails_before_creating_client():
     with patch(
         "app.services.gemini.get_settings",
         return_value=SimpleNamespace(
+            litellm_api_key="",
+            litellm_base_url="http://192.168.3.200:4000/v1",
+            litellm_model="qwen3.8-27b",
             gemini_api_key="",
             gemini_model="test-model",
         ),
-    ), patch("app.services.gemini.genai.Client") as client_factory:
+    ), patch(
+        "app.services.gemini.llm_configured",
+        return_value=False,
+    ), patch(
+        "app.services.gemini.chat_completion_json",
+    ) as chat:
         with pytest.raises(gemini.GeminiNotConfigured):
             gemini.analyze_submission(SOURCE_TEXT, "test", "en")
 
-    client_factory.assert_not_called()
+    chat.assert_not_called()
 
 
-def test_transient_provider_failure_uses_bounded_retry(gemini_client):
-    response = SimpleNamespace(text=json.dumps(extraction_payload()))
-    gemini_client.models.generate_content.side_effect = [
-        ServerError(503, {"error": {"message": "temporarily unavailable"}}),
-        response,
-    ]
-
-    with patch("app.services.gemini.time.sleep") as sleep:
-        result, _ = gemini.analyze_submission(SOURCE_TEXT, "test", "en")
-
-    assert isinstance(result, ProblemExtraction)
-    assert gemini_client.models.generate_content.call_count == 2
-    sleep.assert_called_once_with(0.5)
-
-
-def test_transient_provider_failure_stops_at_attempt_limit(gemini_client):
-    gemini_client.models.generate_content.side_effect = ServerError(
-        503,
-        {"error": {"message": "temporarily unavailable"}},
+def test_provider_failure_is_controlled_error(litellm_chat):
+    litellm_chat.side_effect = LLMAnalysisError(
+        "LiteLLM request failed after 3 attempts (HTTPStatusError)."
     )
 
-    with patch("app.services.gemini.time.sleep") as sleep:
-        with pytest.raises(
-            gemini.GeminiAnalysisError,
-            match="after 3 attempts",
-        ):
-            gemini.analyze_submission(SOURCE_TEXT, "test", "en")
-
-    assert gemini_client.models.generate_content.call_count == 3
-    assert [call.args[0] for call in sleep.call_args_list] == [0.5, 1.0]
+    with pytest.raises(
+        gemini.GeminiAnalysisError,
+        match="after 3 attempts",
+    ):
+        gemini.analyze_submission(SOURCE_TEXT, "test", "en")
 
 
 def test_scores_reject_boolean_values():

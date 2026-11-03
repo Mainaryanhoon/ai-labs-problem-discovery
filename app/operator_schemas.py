@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -60,6 +60,29 @@ class OpportunitySummaryRead(BaseModel):
     updated_at: datetime | None = None
     score: float | None
     evidence_level: str
+    weight_version: str | None = None
+    section: str | None = None
+    score_components: dict[str, int] = Field(default_factory=dict)
+    score_component_contributions: dict[str, float] = Field(
+        default_factory=dict
+    )
+    top10_eligible: bool = False
+    product_ready: bool = False
+    single_source_capped: bool = False
+    offering_angle: str = "undetermined"
+    smallest_first_version: str | None = None
+    first_client_type: str | None = None
+    why_now: str | None = None
+    first_customer_reach_strategy: str | None = None
+    delivery_type: Literal["service", "product", "unclear"] = "unclear"
+    failure_risk_line: str | None = None
+    demand_metrics: dict[str, Any] = Field(default_factory=dict)
+    demand_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    capability_context_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    supporting_capability_evidence_count: int = 0
+    role_blocked_keep_demand: list[dict[str, Any]] = Field(default_factory=list)
+    commercial_qualification: dict[str, Any] = Field(default_factory=dict)
+    commercial_score_v02: dict[str, Any] = Field(default_factory=dict)
     software_buildability: str = "unclear"
     software_buildability_reasons: list[str] = Field(default_factory=list)
     eligibility: str = "review_required"
@@ -75,6 +98,7 @@ class OpportunitySummaryRead(BaseModel):
     distinct_source_records: int = 0
     eligible_distinct_source_record_count: int = 0
     unique_source_platform_count: int = 0
+    unique_demand_platform_count: int = 0
     recorded_independent_records: int = 0
     verified_independent_records: int = 0
     verified_independent_source_count: int = 0
@@ -217,3 +241,49 @@ class WeeklyTrendPointRead(BaseModel):
 class WeeklyTrendRead(BaseModel):
     cluster_id: int
     items: list[WeeklyTrendPointRead] = Field(default_factory=list)
+
+
+class ClusterFeedbackCreate(BaseModel):
+    decision: Literal["accepted", "rejected"]
+    reason: str = Field(min_length=1, max_length=4000)
+    reviewer: str | None = Field(default="ui", max_length=100)
+
+
+class ClusterFeedbackRead(BaseModel):
+    cluster_id: int
+    lead_id: int | None = None
+    decision: Literal["accepted", "rejected"]
+    reason: str
+    reviewer: str
+    recorded: bool = True
+
+
+class LeadDashboardRead(BaseModel):
+    """Weekly business lead row for the commercial-first dashboard."""
+
+    cluster_id: int
+    lead_id: int
+    title: str
+    category: str | None = None
+    status: str | None = None
+    created_at: datetime | None = None
+    score: float | None
+    evidence_level: str = "lead"
+    why_now: str | None = None
+    first_customer_reach_strategy: str | None = None
+    delivery_type: Literal["service", "product", "unclear"] = "unclear"
+    problem_statement: str | None = None
+    smallest_first_version: str | None = None
+    source_url: str | None = None
+    corroborating_urls: list[str] = Field(default_factory=list)
+    evidence_quotes: list[str] = Field(default_factory=list)
+    raw_attached_record_count: int = 1
+    unique_evidence_count: int = 1
+    evidence_citations: list[str] = Field(default_factory=list)
+
+
+class LeadListRead(BaseModel):
+    items: list[LeadDashboardRead]
+    total: int
+    limit: int
+    offset: int

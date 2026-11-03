@@ -3,6 +3,38 @@
 Status reflects local code and deterministic test validation. Live provider
 compatibility and human-labeled quality remain separate, unverified gates.
 
+**Product SoT:** [`MASTER_SPECIFICATION.md`](MASTER_SPECIFICATION.md) — **find new paid problems first, determine Tatvic delivery second.** Dual lanes (market leads vs Tatvic delivery). Deadline 2026-10-30; LiteLLM-first; acceptance §8.
+
+**Architecture tracker:** [`docs/DISCOVERY_OBJECTIVE_FIX.md`](docs/DISCOVERY_OBJECTIVE_FIX.md) — **P0 / P1 / P2 closed** (2026-11-02). Remaining work is live calibration, not those architectural blockers.
+
+**Living gaps:** [`docs/IMPLEMENTATION_GAP_REPORT.md`](docs/IMPLEMENTATION_GAP_REPORT.md) (ops / live-provider holes only).
+**Historical Phase 1 audit:** [`docs/PHASE1_AUDIT_GAP_REPORT.md`](docs/PHASE1_AUDIT_GAP_REPORT.md) (do not treat its §7 counts as current).
+
+**Weekly command:** `python scripts/weekly_run.py` → `data/reports/leads_YYYY-MM-DD.md`. `python -m app.leads` does not collect.
+**Reports:** `data/reports/leads_YYYY-MM-DD.md` and `data/reports/opportunities_YYYY-MM-DD.md`.
+**Email (optional):** Gmail API only (MASTER §7.1); SMTP is out of contract.
+
+**Scoring:** active cluster `v0.1` commercial-first (commercial 35, demand 20, india 15, fit 10, readiness 10, effort 5, defensibility 5). `india_relevance` capped by verified text. `N1_IDEA_CONTEXT` keeps market/idea items. Commercial ≥4 or C-suite/budget-holder bypasses Tatvic-offering keyword gates. Missing qualitative → 1 + `"no evidence"`. Optional normalizer fields do not coerce-to-3.
+
+**Latest backend tests:** 345 passed, 1 Starlette/httpx warning (2026-11-02).
+
+## OpenClaw policy brain (under the master)
+
+Classifier + product-ready listing obey the master and **all six** files under `docs/tatvic/`:
+
+| Doc | Role |
+|---|---|
+| `SOUL.md` | Analyst role, evidence-first, no hype |
+| `GOAL.md` | 5–10 opportunities; default source wave |
+| `RUBRIC.md` | Gates, reason codes, scoring (`v0.1`) |
+| `ASSETS.md` | Offerings + good-opportunity pattern |
+| `SOURCES.md` | Feeds, tags, subreddits, queries |
+| `AGENTS.md` | Hard rules; policy verification before KEEP |
+
+Default collection wave: official docs, Stack Exchange, Hacker News, Reddit, allowlisted RSS.
+X (`ENABLE_X`, limit 50) and YouTube (`ENABLE_YOUTUBE`, Data API v3, 11-channel pilot) are opt-in.
+Lane 1 weekly leads are not killed by `is_product_ready()` keyword gates. Ranked UI still defaults to `product_ready` clusters.
+
 ## V1 backend roadmap (Phases 0–5)
 
 | Phase | Status | Verified scope and limits |

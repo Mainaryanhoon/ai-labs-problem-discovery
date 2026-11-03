@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 from app import ingestion, social_ingestion
 from sqlalchemy import create_engine, inspect, select
@@ -66,11 +67,17 @@ def test_all_ingestion_adapters_persist_native_identity_and_timestamp_origin(
 ):
     engine, db = _database()
     try:
+        # r/SaaS is not in the noisy-community keyword gate; the fixture must
+        # still clear RUBRIC Gate 1 (≥12 words). Older short copy was dropped
+        # as hygiene, which looked like a missing native-id bug.
         reddit_item = {
             "itemType": "post",
             "postId": "t3_abc123",
-            "title": "Manual reporting is frustrating",
-            "selftext": "I struggle to reconcile weekly reports.",
+            "title": "Manual reporting is frustrating every week",
+            "selftext": (
+                "I struggle to reconcile weekly reports by hand and it "
+                "keeps blocking our analytics close."
+            ),
             "link": "https://www.reddit.com/r/SaaS/comments/abc123/title/",
             "author": "owner",
             "publishingDate": "2024-01-02T03:04:05.000Z",
@@ -95,7 +102,10 @@ def test_all_ingestion_adapters_persist_native_identity_and_timestamp_origin(
 
         duplicate = {
             **reddit_item,
-            "title": "Another title that describes a different frustrating task",
+            "title": (
+                "Another title that describes a different frustrating "
+                "manual reporting task"
+            ),
             "link": "https://old.reddit.com/r/saas/comments/abc123/",
         }
         assert social_ingestion._save_items(
@@ -108,7 +118,10 @@ def test_all_ingestion_adapters_persist_native_identity_and_timestamp_origin(
                 "type": "tweet",
                 "id": "5550001",
                 "url": "https://x.com/example/status/5550001",
-                "text": "I struggle with this frustrating manual workflow.",
+                "text": (
+                    "I struggle with this frustrating manual workflow every "
+                    "week and it wastes hours."
+                ),
                 "lang": "en",
                 "createdAt": "Tue Jan 02 03:04:05 +0000 2024",
                 "author": {"userName": "example"},
@@ -119,20 +132,22 @@ def test_all_ingestion_adapters_persist_native_identity_and_timestamp_origin(
         assert x_record.native_id == "5550001"
         assert x_record.timestamp_origin == "source"
 
+        recent = int(datetime.now(timezone.utc).timestamp()) - 86_400
+
         def fake_get_json(url, *, params, source):
             if "hn.algolia.com" in url:
                 return {"hits": [{
                     "objectID": "4242",
                     "title": "Ask HN: Manual invoice work is frustrating",
                     "story_text": "I struggle with repetitive invoices.",
-                    "created_at_i": 1_704_164_645,
+                    "created_at_i": recent,
                 }]}
             return {"items": [{
                 "question_id": 777,
                 "title": "Manual spreadsheet work is frustrating",
                 "body": "<p>I struggle with repetitive copy-paste.</p>",
                 "link": "https://superuser.com/questions/777/title",
-                "creation_date": 1_704_164_645,
+                "creation_date": recent,
             }]}
 
         monkeypatch.setattr(ingestion, "_get_json", fake_get_json)

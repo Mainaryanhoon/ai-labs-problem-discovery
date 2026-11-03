@@ -32,4 +32,22 @@ def get_db():
 
 def initialize_database(target_engine=None) -> None:
     """Create missing tables without altering existing application tables."""
-    Base.metadata.create_all(bind=target_engine or engine)
+    bind = target_engine or engine
+    Base.metadata.create_all(bind=bind)
+    _ensure_sqlite_column(bind, "leads", "smallest_first_version", "TEXT")
+
+
+def _ensure_sqlite_column(bind, table: str, column: str, ddl_type: str) -> None:
+    url = str(getattr(bind, "url", "") or "")
+    if not url.startswith("sqlite"):
+        return
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(bind)
+    if table not in inspector.get_table_names():
+        return
+    existing = {col["name"] for col in inspector.get_columns(table)}
+    if column in existing:
+        return
+    with bind.begin() as conn:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))

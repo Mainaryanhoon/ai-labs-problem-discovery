@@ -1,7 +1,14 @@
-# Secrets
+# Secrets — never commit real credentials
 .env
 .env.*
 !.env.example
+.agent/.env
+.agent/.env
+# Gmail OAuth (MASTER §7.1) — never commit client secrets or tokens
+data/secrets/
+**/client_secret*.json
+**/gmail_token.json
+**/gmail-credentials*.json
 
 # Python environments and cache
 .venv/
@@ -26,5 +33,6 @@ data/
 # Editor and OS files
 .vscode/
 .DS_Store
-Thumbs.dbfrontend/tsconfig.tsbuildinfo
+Thumbs.db
+frontend/tsconfig.tsbuildinfo
 **/build/

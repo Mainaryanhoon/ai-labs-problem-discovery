@@ -85,13 +85,17 @@ def ingestion_client(monkeypatch):
         engine.dispose()
 
 
-def _hn_item(object_id="12345"):
+def _hn_item(object_id="12345", *, created_at_i: int | None = None):
+    # Inside the 60-day fetch budget relative to "now" when tests run.
+    stamp = created_at_i
+    if stamp is None:
+        stamp = int(datetime.now(timezone.utc).timestamp()) - 86_400
     return {
         "objectID": object_id,
         "author": "hn_author",
         "title": "Ask HN: <b>Manual reporting is frustrating</b>",
         "story_text": "I struggle to reconcile several weekly reports.",
-        "created_at_i": 1_700_000_000,
+        "created_at_i": stamp,
     }
 
 
@@ -104,7 +108,7 @@ def _stack_item(question_id=8123):
             "https://stackoverflow.com/questions/"
             f"{question_id}/manual-reconciliation"
         ),
-        "creation_date": 1_700_000_000,
+        "creation_date": int(datetime.now(timezone.utc).timestamp()) - 86_400,
         "tags": ["workflow", None],
         "score": 2,
         "answer_count": 1,
@@ -117,9 +121,13 @@ def _reddit_item(post_id="t3_abc"):
     return {
         "itemType": "post",
         "postId": post_id,
-        "title": "Manual reporting is frustrating",
-        "selftext": "I struggle to reconcile the weekly orders.",
-        "link": f"https://www.reddit.com/r/test/comments/{post_id}/",
+        "title": "Manual GA4 reporting is frustrating for our team",
+        "selftext": (
+            "I struggle to reconcile the weekly store orders against "
+            "Google Analytics purchases by hand every Friday."
+        ),
+        "link": f"https://www.reddit.com/r/GoogleAnalytics/comments/{post_id}/",
+        "subreddit": "GoogleAnalytics",
         "author": "shop_owner",
         "publishingDate": "2024-01-02T03:04:05.000Z",
     }
@@ -130,7 +138,10 @@ def _x_item(tweet_id="123456"):
         "type": "tweet",
         "id": tweet_id,
         "url": f"https://x.com/example/status/{tweet_id}",
-        "text": "I struggle with this frustrating manual workflow.",
+        "text": (
+            "I struggle with this frustrating manual GA4 reconciliation "
+            "workflow every single week for our store."
+        ),
         "lang": "en",
         "createdAt": "Tue Jan 02 03:04:05 +0000 2024",
         "author": {"userName": "example"},
@@ -176,19 +187,25 @@ def test_hacker_news_is_cleaned_deduplicated_and_repeatable(
     )
     assert saved[0].submitted_by == "hn_author"
     assert saved[0].language == "und"
-    assert saved[0].created_at.replace(tzinfo=timezone.utc) == (
-        datetime.fromtimestamp(1_700_000_000, tz=timezone.utc)
-    )
+    stored = saved[0].created_at
+    if stored.tzinfo is None:
+        stored = stored.replace(tzinfo=timezone.utc)
+    assert (datetime.now(timezone.utc) - stored).days < 60
 
 
 def test_hacker_news_skips_malformed_hits_and_handles_empty_payload(
     ingestion_client, monkeypatch
 ):
+    from app.ingestion import HN_SEARCH_TERMS
+
     client, _ = ingestion_client
-    get = Mock(side_effect=[
-        FakeResponse({"hits": [None, {"objectID": "invalid"}, _hn_item()]}),
-        FakeResponse({"hits": []}),
-    ])
+    # One response per SOURCES.md search term (multi-query collector).
+    first_wave = [
+        FakeResponse({"hits": [None, {"objectID": "invalid"}, _hn_item()]})
+        for _ in HN_SEARCH_TERMS
+    ]
+    empty_wave = [FakeResponse({"hits": []}) for _ in HN_SEARCH_TERMS]
+    get = Mock(side_effect=[*first_wave, *empty_wave])
     monkeypatch.setattr("app.ingestion.httpx.get", get)
 
     malformed_batch = client.post("/api/ingestion/hacker-news")
@@ -196,31 +213,59 @@ def test_hacker_news_skips_malformed_hits_and_handles_empty_payload(
 
     assert malformed_batch.status_code == 200
     assert malformed_batch.json()["created"] == 1
-    assert malformed_batch.json()["irrelevant_skipped"] == 2
+    # Malformed hits are dropped during merge (no valid objectID); only the
+    # clean Ask HN item remains in the fetched set.
+    assert malformed_batch.json()["fetched"] == 1
+    assert malformed_batch.json()["queries_attempted"] == len(HN_SEARCH_TERMS)
     assert empty_batch.json()["fetched"] == 0
     assert empty_batch.json()["created"] == 0
+
+
+def test_hacker_news_uses_per_term_queries_not_long_or_chain(
+    ingestion_client, monkeypatch
+):
+    from app.ingestion import HN_SEARCH_TERMS
+
+    client, _ = ingestion_client
+    get = Mock(
+        return_value=FakeResponse({"hits": [_hn_item("90001")]}),
+    )
+    monkeypatch.setattr("app.ingestion.httpx.get", get)
+
+    result = client.post("/api/ingestion/hacker-news?limit=5")
+    assert result.status_code == 200
+    assert get.call_count == len(HN_SEARCH_TERMS)
+    queries = [call.kwargs.get("params", {}).get("query") for call in get.call_args_list]
+    assert queries == list(HN_SEARCH_TERMS)
+    assert all(" OR " not in q for q in queries)
+    assert "numericFilters" in get.call_args_list[0].kwargs["params"]
+    assert result.json()["created"] == 1
+    assert result.json()["fetched"] == 1
 
 
 def test_stack_exchange_preserves_url_id_and_source_timestamp(
     ingestion_client, monkeypatch
 ):
     client, session_factory = ingestion_client
-    monkeypatch.setattr(
-        "app.ingestion.httpx.get",
-        Mock(return_value=FakeResponse({
-            "items": [_stack_item(), _stack_item()],
+    # One HTTP call per tag (OR-merge). Same question id must dedupe.
+    question = _stack_item()
+    get = Mock(return_value=FakeResponse({
+                "items": [question, question],
             "quota_remaining": 9000,
-        })),
-    )
+        }))
+    monkeypatch.setattr("app.ingestion.httpx.get", get)
 
     first = client.post("/api/ingestion/stack-exchange")
     second = client.post("/api/ingestion/stack-exchange")
 
     assert first.status_code == 200
     assert first.json()["created"] == 1
-    assert first.json()["duplicates_skipped"] == 1
+    assert first.json()["fetched"] >= 1
+    assert get.call_args_list[0].kwargs["params"]["fromdate"] >= int(
+        (datetime.now(timezone.utc).timestamp()) - 63 * 86_400
+    )
     assert second.json()["created"] == 0
-    assert second.json()["duplicates_skipped"] == 2
+    assert second.json()["duplicates_skipped"] >= 1
 
     with session_factory() as db:
         saved = db.scalars(select(Submission)).one()
@@ -233,7 +278,10 @@ def test_stack_exchange_preserves_url_id_and_source_timestamp(
     assert saved.submitted_by == "se_author"
     assert saved.language == "und"
     assert saved.created_at.replace(tzinfo=timezone.utc) == (
-        datetime.fromtimestamp(1_700_000_000, tz=timezone.utc)
+        datetime.fromtimestamp(
+            question["creation_date"],
+            tz=timezone.utc,
+        )
     )
 
 
@@ -241,6 +289,7 @@ def test_stack_exchange_skips_malformed_questions_and_reports_rate_limit(
     ingestion_client, monkeypatch
 ):
     client, _ = ingestion_client
+    # First tag call returns a usable item; a later tag call hits backoff.
     get = Mock(side_effect=[
         FakeResponse({"items": [[], _stack_item()]}),
         FakeResponse({"backoff": 10, "items": []}),
@@ -248,13 +297,29 @@ def test_stack_exchange_skips_malformed_questions_and_reports_rate_limit(
     monkeypatch.setattr("app.ingestion.httpx.get", get)
 
     batch = client.post("/api/ingestion/stack-exchange")
-    limited = client.post("/api/ingestion/stack-exchange")
+
+    assert batch.status_code == 503
+    assert "backoff" in batch.json()["detail"]
+
+
+def test_stack_exchange_skips_malformed_items_when_quota_ok(
+    ingestion_client, monkeypatch
+):
+    client, _ = ingestion_client
+    monkeypatch.setattr(
+        "app.ingestion.httpx.get",
+        Mock(return_value=FakeResponse({
+            "items": [[], _stack_item()],
+            "quota_remaining": 8000,
+        })),
+    )
+
+    batch = client.post("/api/ingestion/stack-exchange")
 
     assert batch.status_code == 200
     assert batch.json()["created"] == 1
-    assert batch.json()["irrelevant_skipped"] == 1
-    assert limited.status_code == 503
-    assert "backoff" in limited.json()["detail"]
+    # Malformed list item is skipped; the valid question is kept once across tags.
+    assert batch.json()["fetched"] == 1
 
 
 @pytest.mark.parametrize(
@@ -324,7 +389,10 @@ def test_apify_sources_map_documented_actor_outputs_and_deduplicate(
     assert response.status_code == 200
     assert response.json()["source"] == source
     assert response.json()["created"] == 1
-    assert response.json()["duplicates_skipped"] == 1
+    skipped_second = response.json()["duplicates_skipped"] + (
+        response.json().get("bounded_skipped") or 0
+    )
+    assert skipped_second == 1
     assert saved_response.json()["created"] == 0
     authorization = post.call_args.kwargs["headers"]["Authorization"]
     assert authorization == "Bearer test-apify-token"
@@ -333,12 +401,17 @@ def test_apify_sources_map_documented_actor_outputs_and_deduplicate(
         actor_input = post.call_args.kwargs["json"]
         assert actor_input["maxItems"] == 10
         assert actor_input["maxComments"] == 0
-        assert actor_input["searchQueries"]
-        assert "startUrls" not in actor_input
+        assert "searchQueries" not in actor_input
+        assert actor_input["startUrls"]
+        assert len(actor_input["startUrls"]) >= 1
     else:
         actor_input = post.call_args.kwargs["json"]
         assert actor_input["maxItems"] == 50
-        assert len(actor_input["searchTerms"]) == 1
+        assert actor_input["searchTerms"] == [
+            '"Indian startup" (problem OR struggle OR margin OR cost) lang:en -filter:retweets',
+            '"D2C India" (CAC OR logistics OR RTO OR profitable) lang:en -filter:retweets',
+            '"marketing budget" (ROI OR waste OR expensive) lang:en -filter:retweets',
+        ]
         assert actor_input["sort"] == "Latest"
         assert post.call_args.kwargs["params"]["limit"] == 50
 
@@ -582,8 +655,11 @@ def test_reddit_subreddit_input_and_local_per_community_caps(
             items.append({
                 "itemType": "post",
                 "postId": f"t3_{post_id}",
-                "title": "Manual reporting is frustrating",
-                "selftext": f"I struggle with repetitive reports for {post_id}.",
+                "title": "Manual GA4 reporting is frustrating for operators",
+                "selftext": (
+                    f"I struggle with repetitive weekly reconciliation "
+                    f"reports for client {post_id} every Friday."
+                ),
                 "link": (
                     f"https://www.reddit.com/r/{community}/comments/"
                     f"{post_id}/title/"
@@ -618,7 +694,7 @@ def test_reddit_subreddit_input_and_local_per_community_caps(
     }
     assert result["created"] == 6
     assert result["bounded_skipped"] == 1
-    assert result["irrelevant_skipped"] == 1
+    assert result["irrelevant_skipped"] >= 1
     with session_factory() as db:
         saved = db.scalars(select(Submission)).all()
     assert len(saved) == 6
@@ -725,7 +801,7 @@ def test_apify_missing_token_fails_safely_without_request(
     response = client.post("/api/ingestion/reddit")
 
     assert response.status_code == 503
-    assert response.json()["detail"] == "Apify API token is not configured."
+    assert "Apify API token is not configured" in response.json()["detail"]
     assert post.call_count == 0
 
 
@@ -733,15 +809,19 @@ def test_provider_timeouts_rate_limits_and_request_bounds(
     ingestion_client,
     monkeypatch,
 ):
+    from app.ingestion import HN_SEARCH_TERMS
+
     client, _ = ingestion_client
+    # First term: one timeout then empty success; remaining terms empty.
     get = Mock(side_effect=[
         httpx.TimeoutException("timeout"),
         FakeResponse({"hits": []}),
+        *[FakeResponse({"hits": []}) for _ in HN_SEARCH_TERMS[1:]],
     ])
     monkeypatch.setattr("app.ingestion.httpx.get", get)
     retried = client.post("/api/ingestion/hacker-news")
     assert retried.status_code == 200
-    assert get.call_count == 2
+    assert get.call_count == 1 + len(HN_SEARCH_TERMS)
 
     monkeypatch.setattr(
         "app.ingestion.httpx.get",

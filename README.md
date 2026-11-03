@@ -1,11 +1,31 @@
 # ai-labs-problem-discovery
-A system that reads thousands of public complaints (Reddit posts, app reviews, tweets), throws away the junk, groups the complaints that describe the same problem, scores each group, and shows the top 10 problems with a rough revenue range for solving each one. It’s a “problem discovery engine” for founders.
+
+**Tatvic Labs** problem-discovery engine: **find new paid problems first, determine Tatvic delivery second.** Collect permitted public evidence (budget-holder and market signals **and** practitioner posts), cluster the same problem once, score with commercial-first RUBRIC `v0.1`, and surface India-first **leads** for Khilav Joshi — never a padded generic Top 10 with invented revenue.
+
+**Single source of truth:** [`MASTER_SPECIFICATION.md`](MASTER_SPECIFICATION.md)
+**Deadline:** 2026-10-30 · **Model policy:** local LiteLLM primary · **Default sources:** docs, Stack Exchange, Reddit, Hacker News, approved RSS. **Opt-in:** X (`ENABLE_X`, limit 50) and YouTube (`ENABLE_YOUTUBE`, Data API v3, 11-channel pilot)
+**Weekly command:** `python scripts/weekly_run.py` → `data/reports/leads_YYYY-MM-DD.md` (`python -m app.leads` does not collect)
+**Reports:** `data/reports/leads_YYYY-MM-DD.md` and `data/reports/opportunities_YYYY-MM-DD.md` · **Optional email:** Gmail API only (not SMTP; see master §7.1)
+
+Policy brain: `docs/tatvic/` (SOUL, GOAL, RUBRIC, ASSETS, SOURCES, AGENTS).
+Architecture tracker: [`docs/DISCOVERY_OBJECTIVE_FIX.md`](docs/DISCOVERY_OBJECTIVE_FIX.md) (P0–P2 closed). Living gaps: [`docs/IMPLEMENTATION_GAP_REPORT.md`](docs/IMPLEMENTATION_GAP_REPORT.md). Operator API notes: `docs/OPERATOR_API.md`.
 
 ## Local backend verification
 
 Use a supported Python interpreter and a local virtual environment. Install the
 dependencies from `requirements.txt`, configure provider credentials locally
 without displaying or committing them, then start the development server:
+
+**Linux / macOS** (use the project venv — system `uvicorn` does not have FastAPI):
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+source .venv/bin/activate   # or: ./scripts/dev-api.sh
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+**Windows:**
 
 ```cmd
 py -m venv .venv
@@ -29,11 +49,27 @@ credentials. To run deterministic backend tests without provider calls:
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Provider-backed ingestion, Gemini analysis, and pipeline endpoints can incur
-costs. Do not use them as local smoke tests unless the provider, account,
-limits, and requested input have been reviewed. See
-[`docs/OPERATOR_API.md`](docs/OPERATOR_API.md) for bounded API verification
-and run-scoped pipeline behavior.
+Provider-backed ingestion, LiteLLM analysis (Gemini only as optional fallback),
+and pipeline endpoints can incur costs. Do not use them as local smoke tests
+unless the provider, account, limits, and requested input have been reviewed.
+See [`docs/OPERATOR_API.md`](docs/OPERATOR_API.md) for bounded API verification
+and run-scoped pipeline behavior. Product intent and acceptance live in
+[`MASTER_SPECIFICATION.md`](MASTER_SPECIFICATION.md).
+
+## Weekly discovery (leads lane)
+
+Collect articles (and optional X/YouTube), extract leads, write the markdown report.
+This is **not** the same as `python -m app.leads` (extract/report/review only).
+
+```bash
+# Bounded / no LLM
+LEADS_COLLECT_LIMIT=10 LEADS_MAX_LLM_CALLS=0 python scripts/weekly_run.py
+
+# Full weekly with opt-in X + YouTube (X is always limit=50)
+ENABLE_X=true ENABLE_YOUTUBE=true LEADS_COLLECT_LIMIT=80 LEADS_MAX_LLM_CALLS=40 python scripts/weekly_run.py
+```
+
+The script does not send email and does not install cron. Reddit remains a default **pipeline** source, not a weekly_run collector.
 
 ## Local dashboard
 

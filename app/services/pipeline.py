@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import json
+import os
 from fastapi import HTTPException
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -16,11 +17,17 @@ from app.models import (
     PipelineSubmissionState,
     Submission,
 )
+from app.article_ingestion import collect_articles
+from app.docs_ingestion import collect_official_docs
 from app.ingestion import collect_hacker_news, collect_stack_exchange
 from app.pipeline_schemas import PipelineRunRequest
 from app.ranking import ACTIONABLE_SIGNAL_TYPES
 from app.social_ingestion import collect_reddit, collect_x
+
 from app.services.analysis import analyze_pending_batch
+from app.services.discovery_report import write_discovery_opportunities_report
+from app.services.source_yield import normalize_source_yield
+from app.youtube_ingestion import collect_youtube
 
 LOCK_LEASE = timedelta(minutes=10)
 
@@ -242,6 +249,7 @@ def _provider_failure_code(exc: Exception) -> str:
     return "internal_error"
 
 
+
 def run_pipeline(
     request: PipelineRunRequest,
     db: Session,
@@ -287,7 +295,20 @@ def run_pipeline(
             if request.reddit_subreddits
             else collect_reddit(request.reddit_limit, db)
         ),
-        "x": lambda: collect_x(request.x_limit, db),
+        "x": lambda: (
+            collect_x(request.x_limit, db)
+            if os.getenv("ENABLE_X", "").strip().lower() in {"1", "true", "yes"}
+            else {
+                "source": "x", "status": "disabled", "fetch_status": "disabled_by_policy",
+                "attempted": False, "created": 0, "submission_ids": [],
+            }
+        ),
+
+        "youtube": lambda: collect_youtube(request.youtube_limit, db),
+        "official_docs": lambda: collect_official_docs(
+            request.official_docs_limit, db
+        ),
+        "articles": lambda: collect_articles(request.articles_limit, db),
     }
     collection = {}
     collected_submission_ids: set[int] = set()
@@ -415,15 +436,22 @@ def run_pipeline(
                 for link in run_submissions
                 if link.source_metadata
             }
+            analysis_submission_ids = (
+                None
+                if request.analysis_scope == "backlog"
+                else sorted(collected_submission_ids)
+            )
             analysis = analyze_pending_batch(
                 db,
                 request.analysis_limit,
                 analyzer=analyzer,
                 before_item=lambda: _renew_lock(db, token),
                 retry_failed=request.retry_failed_analysis,
-                submission_ids=sorted(collected_submission_ids),
+                submission_ids=analysis_submission_ids,
                 source_context_by_submission_id=(
                     source_context_by_submission_id
+                    if analysis_submission_ids is not None
+                    else None
                 ),
             )
         except Exception:
@@ -451,14 +479,29 @@ def run_pipeline(
                 _failure("analysis", code="analysis_failed")
             )
 
+        if request.analysis_scope == "backlog":
+            clustering_submission_ids = {
+                int(item["submission_id"])
+                for item in analysis.get("items", [])
+                if item.get("status") == "completed"
+                and item.get("submission_id") is not None
+            }
+        else:
+            clustering_submission_ids = collected_submission_ids
+
+        if clustering_submission_ids:
+            candidate_filter = Submission.id.in_(clustering_submission_ids)
+        else:
+            candidate_filter = Submission.id.in_(
+                select(PipelineRunSubmission.submission_id).where(
+                    PipelineRunSubmission.run_id == token
+                )
+            )
+
         candidates = db.scalars(
             select(Submission)
             .where(
-                Submission.id.in_(
-                    select(PipelineRunSubmission.submission_id).where(
-                        PipelineRunSubmission.run_id == token
-                    )
-                ),
+                candidate_filter,
                 Submission.analysis_status == "completed",
             )
             .order_by(Submission.created_at.asc(), Submission.id.asc())
@@ -578,10 +621,8 @@ def run_pipeline(
                     )
                 )
 
-        clustering["skipped"] += max(
-            0,
-            len(eligible) - request.clustering_limit,
-        )
+        deferred_count = max(0, len(eligible) - request.clustering_limit)
+        clustering["skipped"] += deferred_count
 
         for cluster_id in sorted(affected_cluster_ids):
             try:
@@ -605,6 +646,14 @@ def run_pipeline(
             }
             if outcome.get("status") != "failed":
                 public_collection[source]["status"] = "completed"
+                public_collection[source].setdefault(
+                    "fetch_status", "succeeded"
+                )
+                public_collection[source].setdefault("attempted", True)
+        source_yield = normalize_source_yield(
+            requested_sources=list(request.sources),
+            collection=public_collection,
+        )
         public_analysis = {
             **{
                 key: value
@@ -641,10 +690,9 @@ def run_pipeline(
                 source: {
                     key: value
                     for key, value in outcome.items()
-                    if key not in {"submission_ids", "submission_metadata"}
-                    and isinstance(value, (int, float, bool, str, type(None)))
+                    if isinstance(value, (int, float, bool, str, type(None)))
                 }
-                for source, outcome in collection.items()
+                for source, outcome in source_yield.items()
             },
             "analysis": {
                 key: analysis.get(key)
@@ -661,19 +709,52 @@ def run_pipeline(
                 if key in analysis
             },
             "clustering": {
-                key: clustering[key]
-                for key in (
-                    "considered",
-                    "matched",
-                    "created",
-                    "duplicates",
-                    "already_clustered",
-                    "needs_review",
-                    "failed",
-                    "skipped",
-                )
+                **{
+                    key: clustering[key]
+                    for key in (
+                        "considered",
+                        "matched",
+                        "created",
+                        "duplicates",
+                        "already_clustered",
+                        "needs_review",
+                        "failed",
+                        "skipped",
+                    )
+                },
+                "deferred_clustering_count": deferred_count,
             },
         }
+
+        # Local discovery report is mandatory; email is never triggered here.
+        discovery_report: dict = {"status": "skipped"}
+        try:
+            discovery_report = write_discovery_opportunities_report(
+                db,
+                summarize_opportunity,
+                run_id=token,
+                run_date=datetime.now(timezone.utc).date(),
+                collection_summary=source_yield,
+                stage_counts=stage_counts,
+            )
+            stage_counts["discovery_report"] = {
+                key: discovery_report.get(key)
+                for key in (
+                    "status",
+                    "path",
+                    "run_date",
+                    "ranked_count",
+                    "watchlist_count",
+                    "shortfall",
+                )
+            }
+        except Exception:
+            discovery_report = {"status": "failed"}
+            stage_counts["discovery_report"] = {"status": "failed"}
+            failures.append(
+                _failure("discovery_report", code="report_write_error")
+            )
+
         collection_succeeded = any(
             outcome.get("status") != "failed"
             for outcome in collection.values()
@@ -716,10 +797,12 @@ def run_pipeline(
                 "recover_interrupted_run": request.recover_interrupted_run,
             },
             "collection": public_collection,
+            "source_yield": source_yield,
             "analysis": public_analysis,
             "clustering": clustering,
             "affected_cluster_ids": sorted(affected_cluster_ids),
             "opportunity_summaries": summaries,
+            "discovery_report": discovery_report,
             "failures": failures,
         }
     except Exception:

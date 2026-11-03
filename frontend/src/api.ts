@@ -18,6 +18,9 @@ export type Opportunity = {
   updated_at: string | null;
   score: number | null;
   evidence_level: string;
+  why_now?: string | null;
+  first_customer_reach_strategy?: string | null;
+  delivery_type?: string | null;
   software_buildability: string;
   software_buildability_reasons: string[];
   eligibility: string;
@@ -28,6 +31,23 @@ export type Opportunity = {
   unique_source_platform_count: number;
   reasons: string[];
   limitations: string[];
+  weight_version?: string | null;
+  section?: string | null;
+  score_components?: Record<string, number>;
+  score_component_contributions?: Record<string, number>;
+  top10_eligible?: boolean;
+  product_ready?: boolean;
+  single_source_capped?: boolean;
+  offering_angle?: string;
+  problem_statement?: string | null;
+  evidence_quotes?: string[];
+  demand_evidence?: Array<{ quote?: string | null; [key: string]: unknown }>;
+  smallest_first_version?: string | null;
+  source_url?: string | null;
+  corroborating_urls?: string[];
+  first_client_type?: string | null;
+  failure_risk_line?: string | null;
+  demand_metrics?: Record<string, unknown>;
   evidence_provenance: EvidenceProvenance[];
 };
 
@@ -55,6 +75,36 @@ export type EvidenceProvenance = {
     timestamp_origin: string;
     collected_at: string;
   }>;
+};
+
+export type LeadDashboardItem = {
+  cluster_id: number;
+  lead_id: number;
+  title: string;
+  category: string | null;
+  status: string | null;
+  created_at: string | null;
+  score: number | null;
+  evidence_level: string;
+  why_now?: string | null;
+  first_customer_reach_strategy?: string | null;
+  delivery_type?: string | null;
+  problem_statement?: string | null;
+  smallest_first_version?: string | null;
+  source_url?: string | null;
+  corroborating_urls?: string[];
+  evidence_quotes?: string[];
+  demand_evidence?: Array<{ quote?: string | null; [key: string]: unknown }>;
+  raw_attached_record_count: number;
+  unique_evidence_count: number;
+  evidence_citations?: string[];
+};
+
+export type LeadPage = {
+  items: LeadDashboardItem[];
+  total: number;
+  limit: number;
+  offset: number;
 };
 
 export type OpportunityPage = {
@@ -123,8 +173,59 @@ export type PipelineRequest = {
   stack_exchange_site: string;
   reddit_limit: number;
   x_limit: 50;
+  youtube_limit?: number;
+  official_docs_limit?: number;
+  articles_limit?: number;
   analysis_limit: number;
+  analysis_scope?: "this_run" | "backlog";
+  retry_failed_analysis?: boolean;
   clustering_limit: number;
+};
+
+export type RankingItem = {
+  rank: number;
+  cluster_id: number;
+  title: string;
+  section?: string | null;
+  category?: string | null;
+  score: number;
+  evidence_level: string;
+  offering_angle?: string | null;
+  smallest_first_version?: string | null;
+  first_client_type?: string | null;
+  failure_risk_line?: string | null;
+  reasons?: string[];
+  limitations?: string[];
+  components?: Record<string, number>;
+};
+
+export type WeeklySnapshot = {
+  week_start: string;
+  generated_at: string;
+  top_k: number;
+  items: RankingItem[];
+};
+
+export type MonthlySnapshot = {
+  month_start: string;
+  generated_at: string;
+  top_k: number;
+  weight_version?: string | null;
+  email_status?: string | null;
+  items: RankingItem[];
+};
+
+export type RankingHistory = {
+  items: Array<{
+    week_start?: string;
+    month_start?: string;
+    generated_at: string;
+    top_k: number;
+    entry_count: number;
+    email_status?: string | null;
+  }>;
+  total: number;
+  limit: number;
 };
 
 const apiBase = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
@@ -173,9 +274,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<{ status: string; service: string; version: string }>("/health"),
+  leads: async () => {
+    const result = await request<unknown>("/api/leads?limit=100&offset=0");
+    if (
+      !isRecord(result) ||
+      !Array.isArray(result.items) ||
+      typeof result.total !== "number"
+    ) {
+      throw new Error("The leads endpoint returned an invalid response.");
+    }
+    return result as LeadPage;
+  },
   opportunities: async () => {
     const result = await request<unknown>(
-      "/api/opportunities?limit=100&offset=0&sort_by=score&sort_order=desc",
+      "/api/opportunities?limit=100&offset=0&sort_by=score&sort_order=desc&product_ready_only=true",
     );
     if (
       !isRecord(result) ||
@@ -207,9 +319,84 @@ export const api = {
       evidence_provenance: EvidenceProvenance[];
       opportunity_summary: Opportunity | null;
     }>(`/api/clusters/${clusterId}`),
-  startPipeline: (payload: PipelineRequest) =>
+  startPipeline: (payload?: PipelineRequest) =>
     request<Record<string, unknown>>("/api/pipeline/run", {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify(
+        payload ?? {
+          sources: ["articles", "hacker_news", "stack_exchange", "x", "youtube"],
+          hacker_news_limit: 50,
+          stack_exchange_limit: 50,
+          stack_exchange_site: "stackoverflow",
+          reddit_limit: 10,
+          x_limit: 50,
+          youtube_limit: 50,
+          official_docs_limit: 25,
+          articles_limit: 50,
+          analysis_limit: 50,
+          analysis_scope: "backlog",
+          retry_failed_analysis: true,
+          clustering_limit: 50,
+        },
+      ),
     }),
+  recordFeedback: async (
+    clusterId: number,
+    decision: "accepted" | "rejected",
+    reason: string,
+  ) => {
+    const res = await fetch(`${apiBase}/api/clusters/${clusterId}/feedback`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ decision, reason }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try {
+        const body = (await res.json()) as { detail?: unknown };
+        if (typeof body.detail === "string") detail = body.detail;
+      } catch {
+        detail = "";
+      }
+      throw new Error(detail || `Failed to record feedback (HTTP ${res.status}).`);
+    }
+    return res.json();
+  },
+  weeklySnapshots: () =>
+    request<RankingHistory>("/api/rankings/weekly/snapshots?limit=12"),
+  weeklySnapshot: (weekStart: string) =>
+    request<WeeklySnapshot>(
+      `/api/rankings/weekly/snapshots/${encodeURIComponent(weekStart)}`,
+    ),
+  createWeeklySnapshot: () =>
+    request<WeeklySnapshot>("/api/rankings/weekly/snapshots", { method: "POST" }),
+  monthlySnapshots: () =>
+    request<RankingHistory>("/api/rankings/monthly/snapshots?limit=12"),
+  monthlySnapshot: (monthStart: string) =>
+    request<MonthlySnapshot>(
+      `/api/rankings/monthly/snapshots/${encodeURIComponent(monthStart)}`,
+    ),
+  createMonthlySnapshot: (force = false) =>
+    request<MonthlySnapshot>(
+      `/api/rankings/monthly/snapshots?force=${force ? "true" : "false"}`,
+      { method: "POST" },
+    ),
+  sendCeoReport: (sendEmail = true, force = false) =>
+    request<{
+      snapshot: MonthlySnapshot;
+      email: { sent: boolean; status: string; to?: string; note?: string };
+      files?: {
+        html_path?: string;
+        text_path?: string;
+        latest_html?: string;
+        latest_text?: string;
+      };
+      intended_recipient?: string | null;
+    }>(
+      `/api/reports/monthly/ceo?send_email=${sendEmail ? "true" : "false"}&force=${force ? "true" : "false"}`,
+      { method: "POST" },
+    ),
 };

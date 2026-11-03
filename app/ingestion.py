@@ -6,15 +6,17 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.clustering import canonicalize_url, normalize_text
 from app.db import get_db
+from app.docs_filter_helpers import fetch_not_before, should_fetch_new_item
 from app.models import SourceObservation, Submission
 from app.provenance import (
     known_observation_urls,
     known_native_ids,
+    newest_source_created_at,
     parse_source_reference,
     record_source_observation,
     record_source_provenance,
@@ -154,20 +156,83 @@ def _known_source_urls(db: Session, source_name: str) -> set[str]:
     return urls
 
 
-def collect_hacker_news(limit: int, db: Session) -> dict:
-    """Fetch and persist a bounded batch of relevant Ask HN posts."""
+# SOURCES.md §6 — Algolia rejects long OR-chains of quoted phrases (returns
+# zero hits). Query each term separately and merge by objectID.
+HN_SEARCH_TERMS = (
+    "BigQuery",
+    "GA4",
+    "Google Analytics",
+    "Tag Manager",
+    "TimesFM",
+    "A/B testing",
+    "text-to-SQL",
+    "analytics agent",
+    "forecasting agent",
+)
 
-    payload = _get_json(
-        HN_API,
-        params={"tags": "ask_hn", "hitsPerPage": limit},
-        source="Hacker News",
-    )
-    if not isinstance(payload, dict) or not isinstance(payload.get("hits"), list):
-        raise HTTPException(
-            status_code=502,
-            detail="Hacker News returned an unexpected response format.",
+
+def _newest_hacker_news_timestamp(db: Session) -> datetime | None:
+    return db.scalar(
+        select(func.max(Submission.created_at)).where(
+            Submission.source_name == "Hacker News"
         )
-    hits = payload["hits"]
+    )
+
+
+def _fetch_hacker_news_hits(limit: int, *, not_before: datetime) -> list[dict]:
+    """Merge per-term Algolia searches; apply RUBRIC fetch-budget lower bound."""
+    per_page = max(3, min(limit, 20))
+    cutoff_i = int(not_before.timestamp())
+    by_id: dict[str, dict] = {}
+    queries_attempted = 0
+    for term in HN_SEARCH_TERMS:
+        payload = _get_json(
+            HN_API,
+            params={
+                "query": term,
+                "tags": "(story,ask_hn,show_hn)",
+                "hitsPerPage": per_page,
+                "numericFilters": f"created_at_i>{cutoff_i}",
+            },
+            source="Hacker News",
+        )
+        queries_attempted += 1
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("hits"), list
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail="Hacker News returned an unexpected response format.",
+            )
+        for hit in payload["hits"]:
+            if not isinstance(hit, dict):
+                continue
+            object_id = hit.get("objectID")
+            if isinstance(object_id, bool) or not isinstance(
+                object_id, (str, int)
+            ):
+                continue
+            key = str(object_id).strip()
+            if not key or not re.fullmatch(r"\d+", key) or key in by_id:
+                continue
+            by_id[key] = hit
+    hits = sorted(
+        by_id.values(),
+        key=lambda item: int(item.get("created_at_i") or 0),
+        reverse=True,
+    )
+    # Annotate for callers that want query diagnostics without changing shape.
+    for hit in hits:
+        hit.setdefault("_hn_queries_attempted", queries_attempted)
+    return hits[: max(limit * 3, limit)]
+
+
+def collect_hacker_news(limit: int, db: Session) -> dict:
+    """Fetch Tatvic-domain HN posts (Ask HN + keyword stories)."""
+
+    newest_stored = _newest_hacker_news_timestamp(db)
+    not_before = fetch_not_before(newest_stored)
+    hits = _fetch_hacker_news_hits(limit, not_before=not_before)
     submissions_by_url, submissions_by_text = _existing_source_records(db)
     known_source_urls = _known_source_urls(db, "Hacker News")
     known_ids = known_native_ids(db, "Hacker News")
@@ -176,7 +241,13 @@ def collect_hacker_news(limit: int, db: Session) -> dict:
     duplicates = 0
     observations_linked = 0
     irrelevant = 0
+    budget_skipped = 0
     submission_ids = []
+    queries_attempted = (
+        int(hits[0].get("_hn_queries_attempted") or len(HN_SEARCH_TERMS))
+        if hits
+        else len(HN_SEARCH_TERMS)
+    )
 
     for hit in hits:
         if not isinstance(hit, dict):
@@ -189,18 +260,30 @@ def collect_hacker_news(limit: int, db: Session) -> dict:
             object_id = ""
         object_id = str(object_id).strip()
 
-        # Exclude ordinary stories and broad monthly threads.
-        if not title.lower().startswith("ask hn:"):
-            irrelevant += 1
-            continue
-
         text = f"{title}\n\n{body}".strip()
-        if len(text) < 15 or not PROBLEM_SIGNALS.search(text):
+        # Keep Ask HN always; keep keyword stories even without pain phrasing
+        # (capability launches are useful corroboration).
+        is_ask = title.lower().startswith("ask hn:")
+        if len(text) < 15:
             irrelevant += 1
             continue
+        if not is_ask and not PROBLEM_SIGNALS.search(text):
+            # Still keep if the Algolia keyword query already matched domain terms
+            # and the post is specific enough.
+            if len(text) < 40:
+                irrelevant += 1
+                continue
 
         if not object_id or not re.fullmatch(r"\d+", object_id):
             irrelevant += 1
+            continue
+
+        source_created_at = parse_source_datetime(hit.get("created_at_i"))
+        if not should_fetch_new_item(
+            source_created_at,
+            newest_stored=newest_stored,
+        ):
+            budget_skipped += 1
             continue
 
         url = f"https://news.ycombinator.com/item?id={object_id}"
@@ -231,15 +314,16 @@ def collect_hacker_news(limit: int, db: Session) -> dict:
                 canonical_url=canonical_url,
                 native_id=reference.native_id,
                 community=reference.community,
-                source_created_at=parse_source_datetime(
-                    hit.get("created_at_i")
-                ),
+                source_created_at=source_created_at,
             )
             duplicates += 1
             observations_linked += 1
             known_source_urls.add(canonical_url)
             if reference.native_id:
                 known_ids.add(reference.native_id)
+            continue
+
+        if created >= limit:
             continue
 
         submission = Submission(
@@ -255,7 +339,6 @@ def collect_hacker_news(limit: int, db: Session) -> dict:
             language="und",
             analysis_status="pending",
         )
-        source_created_at = parse_source_datetime(hit.get("created_at_i"))
         if source_created_at is not None:
             submission.created_at = source_created_at
         db.add(submission)
@@ -288,13 +371,23 @@ def collect_hacker_news(limit: int, db: Session) -> dict:
 
     return {
         "source": "Hacker News",
+        "attempted": True,
+        "fetch_status": "succeeded",
         "fetched": len(hits),
         "created": created,
         "duplicates_skipped": duplicates,
         "observations_linked": observations_linked,
         "irrelevant_skipped": irrelevant,
+        "budget_skipped": budget_skipped,
+        "queries_attempted": queries_attempted,
+        "fetch_not_before": not_before.isoformat(),
         "analysis_status": "pending",
-        "message": "Records saved; Gemini analysis has not been run.",
+        "message": (
+            "Records saved; analysis has not been run."
+            if created or duplicates or hits
+            else "Hacker News fetch succeeded with zero matching hits "
+            "inside the fetch budget."
+        ),
         "submission_ids": submission_ids,
     }
 
@@ -309,18 +402,52 @@ def ingest_hacker_news(
     return result
 
 
-def collect_stack_exchange(limit: int, site: str, db: Session) -> dict:
-    """Import recent Stack Exchange questions as problem candidates."""
+# SOURCES.md tags — SE API "tagged" uses AND across semicolons, so we
+# query each tag separately and OR-merge (otherwise you get random untagged noise).
+STACKOVERFLOW_TAGS = (
+    "google-analytics",
+    "google-analytics-4",
+    "google-tag-manager",
+    "google-bigquery",
+    "bigquery-ml",
+)
+DATASCIENCE_TAGS = ("forecasting", "time-series", "anomaly-detection")
+STATS_TAGS = ("forecasting", "time-series", "ab-test", "experiment-design")
+DATAENGINEERING_TAGS = ("google-bigquery",)
 
+
+def _stack_exchange_tag_list(site: str) -> list[str] | None:
+    if site == "stackoverflow":
+        return list(STACKOVERFLOW_TAGS)
+    if site == "datascience":
+        return list(DATASCIENCE_TAGS)
+    if site == "stats":
+        return list(STATS_TAGS)
+    if site == "dataengineering":
+        return list(DATAENGINEERING_TAGS)
+    return None
+
+
+def _fetch_stack_exchange_questions(
+    *,
+    site: str,
+    limit: int,
+    tagged: str | None,
+    fromdate: int,
+) -> tuple[list[dict[str, Any]], Any]:
+    params: dict[str, Any] = {
+        "site": site,
+        "pagesize": min(limit, 100),
+        "order": "desc",
+        "sort": "creation",
+        "filter": "withbody",
+        "fromdate": fromdate,
+    }
+    if tagged:
+        params["tagged"] = tagged
     payload = _get_json(
         "https://api.stackexchange.com/2.3/questions",
-        params={
-            "site": site,
-            "pagesize": limit,
-            "order": "desc",
-            "sort": "creation",
-            "filter": "withbody",
-        },
+        params=params,
         source="Stack Exchange",
     )
     if not isinstance(payload, dict):
@@ -343,8 +470,50 @@ def collect_stack_exchange(limit: int, site: str, db: Session) -> dict:
             status_code=502,
             detail="Stack Exchange returned an unexpected response format.",
         )
-    questions = payload["items"]
+    items = [item for item in payload["items"] if isinstance(item, dict)]
+    return items, payload.get("quota_remaining")
+
+
+def collect_stack_exchange(limit: int, site: str, db: Session) -> dict:
+    """Import recent Stack Exchange questions as problem candidates."""
+
     source_name = f"Stack Exchange:{site}"
+    newest_stored = newest_source_created_at(db, source_name)
+    not_before = fetch_not_before(newest_stored)
+    fromdate = int(not_before.timestamp())
+    tags = _stack_exchange_tag_list(site)
+    questions: list[dict[str, Any]] = []
+    seen_ids: set[Any] = set()
+    quota_remaining = None
+    if tags:
+        # Split budget across tags so GA4/GTM/BQ each get coverage.
+        per_tag = max(3, (limit + len(tags) - 1) // len(tags))
+        for tag in tags:
+            batch, quota_remaining = _fetch_stack_exchange_questions(
+                site=site,
+                limit=per_tag,
+                tagged=tag,
+                fromdate=fromdate,
+            )
+            for item in batch:
+                qid = item.get("question_id")
+                if qid in seen_ids:
+                    continue
+                seen_ids.add(qid)
+                questions.append(item)
+                if len(questions) >= limit:
+                    break
+            if len(questions) >= limit:
+                break
+    else:
+        questions, quota_remaining = _fetch_stack_exchange_questions(
+            site=site,
+            limit=limit,
+            tagged=None,
+            fromdate=fromdate,
+        )
+        questions = questions[:limit]
+    questions = questions[:limit]
     submissions_by_url, submissions_by_text = _existing_source_records(db)
     known_source_urls = _known_source_urls(db, source_name)
     known_ids = known_native_ids(db, source_name)
@@ -353,11 +522,23 @@ def collect_stack_exchange(limit: int, site: str, db: Session) -> dict:
     duplicates = 0
     observations_linked = 0
     irrelevant = 0
+    budget_skipped = 0
     submission_ids = []
 
     for question in questions:
         if not isinstance(question, dict):
             irrelevant += 1
+            continue
+        question_id = question.get("question_id")
+        if question_id is not None and str(question_id) in known_ids:
+            duplicates += 1
+            continue
+        source_created_at = parse_source_datetime(question.get("creation_date"))
+        if not should_fetch_new_item(
+            source_created_at,
+            newest_stored=newest_stored,
+        ):
+            budget_skipped += 1
             continue
         title = clean_text(question.get("title") or "")
         body = clean_text(question.get("body") or "")
@@ -392,9 +573,6 @@ def collect_stack_exchange(limit: int, site: str, db: Session) -> dict:
             or submissions_by_text.get(normalized)
         )
         if duplicate_submission is not None:
-            source_created_at = parse_source_datetime(
-                question.get("creation_date")
-            )
             record_source_observation(
                 db,
                 duplicate_submission,
@@ -446,7 +624,6 @@ def collect_stack_exchange(limit: int, site: str, db: Session) -> dict:
             language="und",
             analysis_status="pending",
         )
-        source_created_at = parse_source_datetime(question.get("creation_date"))
         if source_created_at is not None:
             submission.created_at = source_created_at
         db.add(submission)
@@ -484,8 +661,10 @@ def collect_stack_exchange(limit: int, site: str, db: Session) -> dict:
         "duplicates_skipped": duplicates,
         "observations_linked": observations_linked,
         "irrelevant_skipped": irrelevant,
+        "budget_skipped": budget_skipped,
         "analysis_status": "pending",
-        "quota_remaining": payload.get("quota_remaining"),
+        "quota_remaining": quota_remaining,
+        "fetch_not_before": not_before.isoformat(),
         "message": "Questions imported; Gemini analysis has not been run.",
         "submission_ids": submission_ids,
     }

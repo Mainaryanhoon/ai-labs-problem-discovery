@@ -1,5 +1,11 @@
 # Problem Discovery — Handoff
 
+> **HISTORICAL snapshot (2026-10-20).** Current product SoT:
+> [`../MASTER_SPECIFICATION.md`](../MASTER_SPECIFICATION.md). Prefer the master for
+> goals, sources, model policy, Gmail-only optional email, and acceptance.
+> Living gaps: [`IMPLEMENTATION_GAP_REPORT.md`](IMPLEMENTATION_GAP_REPORT.md).
+> Use this file for architecture archaeology only.
+
 State: 2026-10-20. Branch inspected: `feat/problem-discovery-foundation`.
 
 ## Architecture (10 lines)
