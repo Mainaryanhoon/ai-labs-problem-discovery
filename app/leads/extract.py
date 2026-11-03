@@ -28,9 +28,13 @@ Rules:
 - delivery_type: "service" (consulting/managed/implementation) or "product" (standalone software).
 - what_to_build_v1 (string): You MUST propose a concrete SaaS feature, service, or tool that solves
   the problem. DO NOT repeat the problem statement. Define exactly what the MVP looks like
-  (who uses it, what it does, what the first output is). Example of BAD: restating
-  "D2C brands lose money to COD fraud". Example of GOOD: "COD-risk score API that flags
-  high-RTO pin codes before ship".
+  (who uses it, what it does, what the first output is). Keep the MVP description concise
+  (maximum 3 to 4 complete sentences). Be direct and finish your thought.
+  Example of BAD: restating "D2C brands lose money to COD fraud". Example of GOOD:
+  "COD-risk score API that flags high-RTO pin codes before ship".
+- STRICTLY FORBIDDEN: Do not propose Ed-Tech platforms, student internships, or human-staffing/
+  consulting services. If the core problem can only be solved by staffing or education, return
+  {"is_lead": false, "reason": "DROP_OUT_OF_SCOPE_TOPIC"}.
 - Score each field 1-5 (integers): commercial_demand (evidence people pay or budgets exist),
   problem_significance, buyer_path (can we name and reach the buyer), why_now (timely trigger),
   tatvic_fit (analytics/cloud/data/AI/CRO delivery fit; low is fine, it is NOT a gate), india_relevance.
@@ -146,6 +150,9 @@ def _v1_repeats_problem(problem: str, v1: str) -> bool:
 def validate_lead(parsed: dict[str, Any], text: str) -> tuple[dict[str, Any] | None, str]:
     """Return (clean_lead, reason). reason explains rejection when clean_lead is None."""
     if not parsed.get("is_lead"):
+        reason = str(parsed.get("reason") or "").strip()
+        if reason == "DROP_OUT_OF_SCOPE_TOPIC":
+            return None, "drop_out_of_scope_topic"
         return None, "model_not_lead"
     for key in REQUIRED_TEXT:
         if not isinstance(parsed.get(key), str) or not parsed[key].strip():

@@ -14,16 +14,19 @@ _WORD_RE = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?")
 REDDIT_TOPIC_KEYWORDS = re.compile(
     r"\b("
     r"ga4|google\s*analytics|gtm|tag\s*manager|tracking|attribution|"
-    r"conversion|a/?b|experiment|bigquery|forecast|dashboard|report|data"
+    r"conversion|a/?b|experiment|bigquery|forecast|dashboard|report|data|"
+    r"saas|mrr|churn|pricing|startup|founder|b2b|revenue|customer|"
+    r"india|indian|d2c|margin|cac|rto|problem|pain|budget"
     r")\b",
     re.IGNORECASE,
 )
 
 NOISY_REDDIT_COMMUNITIES = frozenset({
-    "ecommerce",
-    "shopify",
-    "ppc",
-    "analytics",
+    "startups",
+    "smallbusiness",
+    "sideproject",
+    "startup_ideas",
+    "entrepreneur",
 })
 
 

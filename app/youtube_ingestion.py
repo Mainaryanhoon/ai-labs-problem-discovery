@@ -1,4 +1,8 @@
-"""YouTube niche channels + podcast-style uploads via Apify (no YouTube Data API)."""
+"""YouTube ingestion — Google YouTube Data API v3 primary; Apify actor fallback.
+
+When ``YOUTUBE_API_KEY`` is set, collection uses the Data API path only.
+Apify is used only when the API key is empty.
+"""
 
 from __future__ import annotations
 

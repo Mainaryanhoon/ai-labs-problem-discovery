@@ -1,8 +1,11 @@
 """Article collector.
 
 Discovery uses allowlisted RSS or Atom feeds. Full page text is fetched only
-for URLs that are new and inside the fetch budget. Firecrawl runs first.
-Playwright is the fallback. Feed text is untrusted data and is only stored.
+for URLs that are new and inside the fetch budget.
+
+Scraper order (strict): Firecrawl when ``FIRECRAWL_API_KEY`` is set, then
+Playwright full-page fetch, then an informative RSS summary when permitted.
+Feed text is untrusted data and is only stored.
 """
 
 from __future__ import annotations

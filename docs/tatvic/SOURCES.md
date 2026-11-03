@@ -52,16 +52,17 @@ Use the official API, configured page/result limits, rolling `fromdate`, native
 ID deduplication, and the three-day overlap. A question's tags or keyword match
 do not establish demand without the existing analysis gates.
 
-## 4. Reddit — demand
+## 4. Reddit — demand (commercial / founder lane)
 
-Approved subreddits, maximum 50 recent posts per subreddit: GoogleAnalytics,
-GoogleTagManager, analytics, bigquery, dataengineering, datascience, ecommerce,
-shopify, PPC.
+Approved subreddits (default shortlist in `app/social_ingestion.py`), maximum
+50 recent posts per subreddit when divided across the list:
 
-For ecommerce, shopify, PPC, and analytics, title/body must contain at least one
-of: GA4, Google Analytics, GTM, tag manager, tracking, attribution, conversion,
-A/B, experiment, BigQuery, forecast, dashboard, report, data. This is only a
-cheap prefilter. Existing per-run limits and item classification remain in force.
+SaaS, startups, Entrepreneur, smallbusiness, SideProject, Startup_Ideas,
+EntrepreneurRideAlong, IndianStartups, StartUpIndia, B2BSaaS.
+
+Collection uses Apify only (`APIFY_API_TOKEN`, `APIFY_REDDIT_ACTOR_ID`). Broad
+communities may require a cheap keyword prefilter in code before model spend;
+existing per-run limits and item classification remain in force.
 
 ## 5. Articles and blogs
 
@@ -168,12 +169,21 @@ demand, buying signal, or buyer route must be validated from the individual
 item's cited text and permitted roles. Video mentions alone never satisfy
 independent `KEEP_DEMAND`.
 
-## 8. X (Twitter) — opt-in budget-holder pain
+## 8. X (Twitter) — opt-in B2B SaaS and founder pain
 
 Weekly collection runs only when `ENABLE_X=true`. Call `collect_x(limit=50)`
-(`X_MIN_QUERY_ITEMS`). Actor: `apidojo~tweet-scraper`.
+(`X_MIN_QUERY_ITEMS`). Actor: `apidojo~tweet-scraper`. Apify only
+(`APIFY_API_TOKEN`, `APIFY_X_ACTOR_ID`).
 
-Search terms target Indian startup and D2C budget-holder pain (margin, CAC, RTO,
-marketing-budget ROI). X is market/idea corroboration, not a default demand
-source. Retweets are excluded in the query. Diagnostic counts must show
-collected vs demand-eligible separately.
+Default search terms (see `DEFAULT_X_SEARCH_TERMS` in `app/social_ingestion.py`):
+
+- Indian startup margin/cost pain
+- D2C India CAC, logistics, RTO, profitability
+- Marketing budget ROI / waste
+- SaaS founder churn, MRR, pricing, building in public
+- B2B SaaS vendor pain and alternatives
+- Startup ideas — gaps, opportunities, “wish there was”
+
+X is market/idea corroboration, not a default demand source. Retweets are
+excluded in the query. Diagnostic counts must show collected vs demand-eligible
+separately.

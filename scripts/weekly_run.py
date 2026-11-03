@@ -5,13 +5,21 @@ cron:  0 7 * * MON  cd /path/to/repo && .venv/bin/python scripts/weekly_run.py
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("weekly_run")
 
 from app.config import get_settings  # noqa: E402
 from app.db import SessionLocal, initialize_database  # noqa: E402
@@ -114,16 +122,24 @@ def _send_weekly_email(
 
 
 def main() -> int:
+    pipeline_start_time = time.time()
+    logger.info("Weekly pipeline starting")
+
     initialize_database()
     db = SessionLocal()
     try:
         from app.article_ingestion import collect_articles
 
         collect_limit = int(os.getenv("LEADS_COLLECT_LIMIT", "80"))
+        feed_statuses: list[dict[str, Any]] = []
+        extract_sources = ["articles"]
+
+        logger.info("Phase 1: Collection — starting")
+        phase1_start = time.time()
+
         collected = collect_articles(collect_limit, db, ignore_cursor=True)
         created_total = int(collected.get("created") or 0)
-        feed_statuses: list[dict[str, Any]] = list(collected.get("feed_statuses") or [])
-        extract_sources = ["articles"]
+        feed_statuses = list(collected.get("feed_statuses") or [])
 
         created_total += _safe_collect(
             source="hacker_news",
@@ -177,14 +193,36 @@ def main() -> int:
             )
             extract_sources.append("youtube")
 
+        phase1_seconds = time.time() - phase1_start
+        logger.info(
+            "Phase 1: Collection — finished in %.1fs (%d items created)",
+            phase1_seconds,
+            created_total,
+        )
+
+        logger.info("Phase 2: LLM Extraction/Scoring — starting")
+        phase2_start = time.time()
         funnel = run_extraction(
             db,
             complete_json,
             max_calls=int(os.getenv("LEADS_MAX_LLM_CALLS", "40")),
             sources=tuple(extract_sources),
         )
+        phase2_seconds = time.time() - phase2_start
+        logger.info(
+            "Phase 2: LLM Extraction/Scoring — finished in %.1fs",
+            phase2_seconds,
+        )
+
         funnel["collected"] = created_total
         funnel["feed_statuses"] = feed_statuses
+        funnel["phase_timings_seconds"] = {
+            "collection": round(phase1_seconds, 2),
+            "extraction": round(phase2_seconds, 2),
+        }
+
+        logger.info("Phase 3: Report Generation — starting")
+        phase3_start = time.time()
         report, shown, repeats, watch = write_report(db, funnel, top_n=5)
         email_result = _send_weekly_email(
             db,
@@ -198,6 +236,25 @@ def main() -> int:
         (out / f"funnel_{date.today().isoformat()}.json").write_text(
             json.dumps(funnel, indent=2, default=str),
         )
+        phase3_seconds = time.time() - phase3_start
+        logger.info(
+            "Phase 3: Report Generation — finished in %.1fs",
+            phase3_seconds,
+        )
+
+        total_time_seconds = time.time() - pipeline_start_time
+        funnel["phase_timings_seconds"]["report"] = round(phase3_seconds, 2)
+        funnel["execution_time_seconds"] = round(total_time_seconds, 2)
+        (out / f"funnel_{date.today().isoformat()}.json").write_text(
+            json.dumps(funnel, indent=2, default=str),
+        )
+
+        logger.info(
+            "Pipeline completed in %.2f minutes (%.1f seconds total)",
+            total_time_seconds / 60,
+            total_time_seconds,
+        )
+
         print(f"report: {report} (Top 5 leads: {len(shown)})")
         if email_result.get("sent"):
             print(f"email: sent to {email_result.get('to')} (Top 5 leads)")
@@ -206,6 +263,10 @@ def main() -> int:
         else:
             note = email_result.get("note") or ""
             print(f"email: {email_result.get('status')} {note}".strip())
+        print(
+            f"timing: {total_time_seconds / 60:.2f} minutes "
+            f"({total_time_seconds:.1f}s)"
+        )
         print(json.dumps({k: v for k, v in funnel.items() if k != "feed_statuses"}, indent=2, default=str))
         return 0
     finally:

@@ -111,6 +111,11 @@ def test_v1_that_repeats_problem_is_rejected():
     assert extract.validate_lead(payload, TEXT_RETAIL) == (None, "v1_repeats_problem")
 
 
+def test_drop_out_of_scope_topic_rejected():
+    payload = {"is_lead": False, "reason": "DROP_OUT_OF_SCOPE_TOPIC"}
+    assert extract.validate_lead(payload, TEXT_RETAIL) == (None, "drop_out_of_scope_topic")
+
+
 def test_what_to_build_v1_maps_to_smallest_first_version():
     payload = json.loads(fake_llm()("", ""))
     clean, reason = extract.validate_lead(payload, TEXT_RETAIL)

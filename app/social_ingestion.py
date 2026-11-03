@@ -1,3 +1,8 @@
+"""Reddit and X ingestion via Apify only (APIFY_API_TOKEN + actor IDs).
+
+Reddit and X MUST NOT call native platform APIs directly; all fetches go
+through ``_collect_apify`` → Apify REST API.
+"""
 
 import json
 import threading
@@ -427,21 +432,27 @@ DEFAULT_X_SEARCH_TERMS = [
     '"Indian startup" (problem OR struggle OR margin OR cost) lang:en -filter:retweets',
     '"D2C India" (CAC OR logistics OR RTO OR profitable) lang:en -filter:retweets',
     '"marketing budget" (ROI OR waste OR expensive) lang:en -filter:retweets',
+    '"SaaS founder" (churn OR MRR OR pricing OR "building in public") lang:en -filter:retweets',
+    '"B2B SaaS" (pain OR expensive OR alternative OR vendor) lang:en -filter:retweets',
+    '"startup ideas" (gap OR opportunity OR missing OR "wish there was") lang:en -filter:retweets',
 ]
 
 
 REDDIT_SUBREDDIT_SHORTLIST = (
-    "GoogleAnalytics",
-    "GoogleTagManager",
-    "analytics",
-    "bigquery",
-    "dataengineering",
-    "datascience",
-    "ecommerce",
-    "shopify",
-    "PPC",
+    "SaaS",
+    "startups",
+    "Entrepreneur",
+    "smallbusiness",
+    "SideProject",
+    "Startup_Ideas",
+    "EntrepreneurRideAlong",
+    "IndianStartups",
+    "StartUpIndia",
+    "B2BSaaS",
 )
 MAX_SUBREDDITS = 10
+# Apify cost cap: at most this many posts saved per subreddit (weekly + API runs).
+REDDIT_MAX_POSTS_PER_SUBREDDIT = 12
 X_MIN_QUERY_ITEMS = 50
 _X_RUN_LOCK = threading.Lock()
 
@@ -471,43 +482,38 @@ def collect_reddit(
     subreddits: list[str] | None = None,
 ) -> dict:
     settings = get_settings()
-    actor_input: dict[str, Any] = {
-        "sort": "new",
-        "timeFilter": "month",
-        "maxItems": limit,
-        "maxComments": 0,
-    }
-    per_community_limits = None
+    per_sub_cap = REDDIT_MAX_POSTS_PER_SUBREDDIT
+    per_community_limits: dict[str, int] | None = None
     if subreddits is None:
         names = [
             name
             for raw in REDDIT_SUBREDDIT_SHORTLIST
             if (name := normalize_subreddit(raw))
         ]
-        actor_input["startUrls"] = _reddit_subreddit_urls(
-            list(REDDIT_SUBREDDIT_SHORTLIST)
-        )
-        base_limit, remainder = divmod(limit, max(len(names), 1))
-        per_community_limits = {
-            name: base_limit + int(index < remainder)
-            for index, name in enumerate(names)
-        }
+        actor_input_start_urls = _reddit_subreddit_urls(list(REDDIT_SUBREDDIT_SHORTLIST))
     else:
-        actor_input["startUrls"] = _reddit_subreddit_urls(subreddits)
+        actor_input_start_urls = _reddit_subreddit_urls(subreddits)
         names = list(dict.fromkeys(
             normalize_subreddit(name)
             for name in subreddits
         ))
-        valid_names = [name for name in names if name is not None]
-        base_limit, remainder = divmod(limit, len(valid_names))
-        per_community_limits = {
-            name: base_limit + int(index < remainder)
-            for index, name in enumerate(valid_names)
-        }
+        names = [name for name in names if name is not None]
+
+    if names:
+        per_community_limits = {name: per_sub_cap for name in names}
+
+    apify_item_cap = min(limit, len(names) * per_sub_cap) if names else min(limit, per_sub_cap)
+    actor_input: dict[str, Any] = {
+        "sort": "new",
+        "timeFilter": "month",
+        "maxItems": apify_item_cap,
+        "maxComments": 0,
+        "startUrls": actor_input_start_urls,
+    }
     items = _collect_apify(
         settings.apify_reddit_actor_id,
         actor_input,
-        limit,
+        apify_item_cap,
     )
     result = _save_items(
         db,
@@ -516,6 +522,8 @@ def collect_reddit(
         per_community_limits=per_community_limits,
     )
     result["per_community_limits"] = per_community_limits
+    result["reddit_apify_max_items"] = apify_item_cap
+    result["reddit_max_posts_per_subreddit"] = per_sub_cap
     return result
 
 

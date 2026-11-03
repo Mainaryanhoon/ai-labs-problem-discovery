@@ -643,6 +643,8 @@ def test_reddit_subreddit_input_and_local_per_community_caps(
     ingestion_client,
     monkeypatch,
 ):
+    from app import social_ingestion
+
     client, session_factory = ingestion_client
     _install_settings(monkeypatch)
     items = []
@@ -689,15 +691,15 @@ def test_reddit_subreddit_input_and_local_per_community_caps(
     assert actor_input["maxItems"] == 8
     assert actor_input["maxComments"] == 0
     assert result["per_community_limits"] == {
-        "smallbusiness": 4,
-        "saas": 4,
+        "smallbusiness": social_ingestion.REDDIT_MAX_POSTS_PER_SUBREDDIT,
+        "saas": social_ingestion.REDDIT_MAX_POSTS_PER_SUBREDDIT,
     }
-    assert result["created"] == 6
-    assert result["bounded_skipped"] == 1
+    assert result["created"] == 7
+    assert result["bounded_skipped"] == 0
     assert result["irrelevant_skipped"] >= 1
     with session_factory() as db:
         saved = db.scalars(select(Submission)).all()
-    assert len(saved) == 6
+    assert len(saved) == 7
     assert all(record.source_name == "Reddit" for record in saved)
     assert all(record.source_url.startswith("https://www.reddit.com/r/") for record in saved)
 
